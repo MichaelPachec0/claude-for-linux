@@ -18,36 +18,65 @@ console.log('=== Dynamic Patch: VM Start Intercept ===\n');
 
 let content = fs.readFileSync(INDEX_JS_PATH, 'utf8');
 
-// Discover function signature by matching the stable pattern:
-// async function WORD(WORD,WORD,WORD,WORD){var WORD,...;const WORD=WORD(),...WORD=WORD();WORD.info(`[VM:start]
-const sigRegex = /async function (\w+)\((\w+),(\w+),(\w+),(\w+)\)\{(var \w+(?:,\w+)*;const \w+=\w+\(\),\w+=Date\.now\(\),\w+=new \w+,\w+=\w+\(\);\w+\.info\(`\[VM:start\])/;
-const sigMatch = content.match(sigRegex);
-
-if (!sigMatch) {
-  console.error('  ERROR: Could not find VM start function via [VM:start] pattern');
+// Discover the VM start function. It is the 4-param async function whose body
+// emits the `[VM:start]` log. Rather than pin the exact body preamble (which is
+// refactored between versions — e.g. cleanup loops were added before the
+// Date.now()/info() sequence), locate the first `[VM:start]` and scan back to the
+// nearest enclosing 4-param async declaration. We inject the Linux block right
+// after that function's opening brace, leaving the original body untouched.
+const vmStartIdx = content.indexOf('[VM:start]');
+if (vmStartIdx === -1) {
+  console.error('  ERROR: Could not find [VM:start] log string');
   process.exit(1);
 }
 
-const funcName = sigMatch[1];
-const params = [sigMatch[2], sigMatch[3], sigMatch[4], sigMatch[5]];
-const originalBody = sigMatch[6];
+const declRe = /async function (\w+)\((\w+),(\w+),(\w+),(\w+)\)\{/g;
+let m, decl = null;
+while ((m = declRe.exec(content)) !== null) {
+  if (m.index >= vmStartIdx) break;
+  decl = m;
+}
+
+if (!decl) {
+  console.error('  ERROR: Could not find a 4-param async function before [VM:start]');
+  process.exit(1);
+}
+
+// Sanity check: the discovered declaration should be the immediate encloser —
+// no other function may open between it and the [VM:start] log.
+const bodyHead = content.slice(decl.index + decl[0].length, vmStartIdx);
+if (bodyHead.includes('async function ') || (vmStartIdx - decl.index) > 4000) {
+  console.error('  ERROR: Nearest 4-param async decl is not the [VM:start] encloser');
+  console.error(`         (name=${decl[1]}, distance=${vmStartIdx - decl.index})`);
+  process.exit(1);
+}
+
+const funcName = decl[1];
+const params = [decl[2], decl[3], decl[4], decl[5]];
+const declStr = decl[0]; // e.g. async function ZBr(A,e,t,i){
 
 console.log(`  Found VM start function: ${funcName}(${params.join(',')})`);
 
-// Discover status dispatch: WORD(WORD.Ready) near lam_vm_startup_completed
-const statusRegex = /(\w+)\((\w+)\.Ready\),\w+\("lam_vm_startup_completed"/;
-const statusMatch = content.match(statusRegex);
-
+// Discover the status dispatch: the readiness notifier called immediately before
+// the `lam_vm_startup_completed` analytics event (historically `WORD(WORD.Ready)`,
+// now a zero-arg notifier such as `orA()`). Best-effort; falls back to a log.
 let statusDispatch = 'console.log("[Cowork Linux] Ready")';
-if (statusMatch) {
-  statusDispatch = `${statusMatch[1]}(${statusMatch[2]}.Ready)`;
+const readyArgMatch = content.match(/(\w+)\((\w+)\.Ready\),\w+\("lam_vm_startup_completed"/);
+const readyCallMatch = content.match(/(\w+\(\)),\w+\("lam_vm_startup_completed"/);
+if (readyArgMatch) {
+  statusDispatch = `${readyArgMatch[1]}(${readyArgMatch[2]}.Ready)`;
+  console.log(`  Found status dispatch: ${statusDispatch}`);
+} else if (readyCallMatch) {
+  statusDispatch = readyCallMatch[1];
   console.log(`  Found status dispatch: ${statusDispatch}`);
 } else {
   console.log('  WARNING: Could not find status dispatch, using console.log fallback');
 }
 
-// Build the injection block
-const injection = `async function ${funcName}(${params.join(',')}){
+// Build the injection block: the original function declaration, immediately
+// followed by the Linux short-circuit. The original body is left in place after
+// it (runs for non-Linux, or when a vmInstance already exists).
+const injection = `${declStr}
   if(process.platform==="linux"&&global.__linuxCowork&&!global.__linuxCowork.vmInstance){
     console.log("[Cowork Linux] Creating bubblewrap session");
     const {manager}=global.__linuxCowork;
@@ -95,17 +124,16 @@ const injection = `async function ${funcName}(${params.join(',')}){
       return vmInstance;
     }catch(e){console.error("[Cowork Linux] Session creation failed:",e)}
   }
-  ${originalBody}`;
+  `;
 
-// Find and replace the original function start
-const originalStart = `async function ${funcName}(${params.join(',')}){${originalBody}`;
-
-if (!content.includes(originalStart)) {
+// Inject right after the function's opening brace. The declaration is unique, so
+// String.replace (first occurrence) is safe and leaves the original body intact.
+if (!content.includes(declStr)) {
   console.error('  ERROR: Could not locate original function for replacement');
   process.exit(1);
 }
 
-content = content.replace(originalStart, injection);
+content = content.replace(declStr, injection);
 fs.writeFileSync(INDEX_JS_PATH, content);
 
 // Verify

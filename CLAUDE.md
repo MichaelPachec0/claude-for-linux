@@ -4,8 +4,8 @@ Enabling macOS-only Claude Desktop features on Linux via runtime patching.
 
 ## Architecture
 
-- **Source**: macOS DMG fetched via `fetchurl` (v1.1.3189)
-- **Extraction**: `dmg2img` + `7z` + `asar_tool.py`
+- **Source**: macOS DMG fetched via `fetchurl` (see `claudeVersion` in `flake.nix`)
+- **Extraction**: `7zz` (modern 7-Zip, LZFSE-aware) + `asar_tool.py` — newer DMGs are LZFSE-compressed; `dmg2img` lacks LZFSE support and silently corrupts them
 - **Runtime**: `electron_37` from nixpkgs
 - **Packaging**: Nix flake with `makeWrapper` + `buildFHSEnv`
 
@@ -53,7 +53,7 @@ See `docs/patching-architecture.md` for the full technical analysis.
 | 06 | `perl -pe` regex | Return Linux VM instance from getters |
 | 07 | Append IIFE | Replace "for Windows"/"for Mac" with "for Linux" |
 | 08 | `perl -pe` regex | Use theme-aware PNGs for tray icon |
-| 09 | `perl -pe` regex | DBus tray cleanup delay for stability |
+| 09 | — | **Removed** — injected `await` into now-synchronous fns (crash); see `flake.nix` |
 
 ## Electron Gotchas
 

@@ -11,7 +11,9 @@ This document describes the patching approach in `claude-for-linux`, compares it
 - Each regex patch verified with `grep -qP` post-check
 - Old `scripts/patches-XXXX/` directories removed
 - Standalone IIFEs extracted to `scripts/cowork-init.js` and `scripts/branding-fix.js`
-- New patch 09 added: DBus tray cleanup delay (from claude-desktop-linux-flake)
+- Patch 09 (DBus tray cleanup delay) removed in 1.11847.5: its `await new Promise(...)`
+  injection landed in now-synchronous functions (tray `HAe`, VM pipes `yMi`/`SMi`),
+  a hard SyntaxError at startup. Reintroduce only as an async-aware node-script patch.
 
 ## The Problem
 
@@ -40,8 +42,8 @@ indexContent = indexContent.replace(original, replacement);
 | 01 | Cowork module loader | Appends to end of `index.js` | No |
 | 02 | Platform flag | `VAR=process.platform==="win32"` → add `\|\|"linux"` | **Yes** — variable name |
 | 03 | Availability check | `function NAME(){...platform..."unsupported"}` → prepend Linux return | **Yes** — function name |
-| 04 | Skip download | `async function NAME(t,e){return VAR?` → prepend Linux early-return | **Yes** — function name + guard var |
-| 05 | VM start intercept | `async function NAME(t,e,r,n){...` → prepend Linux bubblewrap session | **Yes** — function name + ~6 internal refs |
+| 04 | Skip download | `async function NAME(VAR,VAR){...[downloadVM]` → prepend Linux early-return | **Yes** — function name + params |
+| 05 | VM start intercept | `async function NAME(VAR,VAR,VAR,VAR){...[VM:start]` → prepend Linux bubblewrap session | **Yes** — function name + ~6 internal refs |
 | 06 | VM getter override | Two small functions → prepend Linux VM return | **Yes** — function names + inner call |
 | 07 | Platform branding | `mainView.js` preload injection | No |
 | 08 | Tray icon fix | Resource path function + icon filename selection | **Yes** — function name + module aliases |
@@ -105,13 +107,18 @@ INDEX=/path/to/extracted/.vite/build/index.js
 grep -oP '.{0,60}process\.platform==="darwin",.{0,4}=process\.platform==="win32".{0,20}' $INDEX
 
 # Patch 03: Availability check — the function that returns {status:"unsupported"}
-grep -oP 'function \w+\(\)\{const t=process\.platform;if\(t!=="darwin"&&t!=="win32"\)return\{status:"unsupported"' $INDEX
+# (the platform var is minified; capture it generically rather than hardcoding `t`)
+grep -oP 'function \w+\(\)\{const \w+=process\.platform;if\(\w+!=="darwin"&&\w+!=="win32"\)return\{status:"unsupported"' $INDEX
 
 # Patch 04: Download guard — the async function near [downloadVM] log messages
+# (params are minified, e.g. (A,e); the verify regex uses \(\w+,\w+\), not literal (t,e))
 grep -oP 'async function \w+\(\w,\w\)\{.{0,200}downloadVM' $INDEX
 
-# Patch 05: VM start — 4-param async function with [VM:start] log
-grep -oP 'async function \w+\(\w,\w,\w,\w\)\{var .{0,80}\[VM:start\]' $INDEX
+# Patch 05: VM start — 4-param async function whose body emits the [VM:start] log.
+# The body preamble is refactored across versions (cleanup loops now precede the
+# Date.now()/info() sequence), so [VM:start] can sit ~400+ chars in. patch-vm-start.js
+# locates the first [VM:start] and scans back to the nearest 4-param async decl.
+grep -oP 'async function \w+\(\w,\w,\w,\w\)\{.{0,600}\[VM:start\]' $INDEX
 
 # Patch 06a: VM getter — returns (t?.vm) ?? null
 grep -oP 'async function \w+\(\)\{const t=await \w+\(\);return\(t==null\?void 0:t\.vm\)\?\?null\}' $INDEX

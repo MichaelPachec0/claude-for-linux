@@ -111,7 +111,7 @@ The **direct variant** (`claude-desktop`) runs electron directly with `makeWrapp
 ### Build Pipeline
 
 1. **Fetch**: Downloads macOS DMG via `fetchurl` (hash-verified)
-2. **Extract**: `dmg2img` + `7z` to get `app.asar` from the `.app` bundle
+2. **Extract**: `7zz` (LZFSE-aware 7-Zip) to get `app.asar` from the `.app` bundle
 3. **Unpack**: `asar_tool.py extract` to get raw JavaScript
 4. **Patch**: 7 Node.js scripts modify the minified code:
    - `00`: Install Linux native module stub
@@ -163,7 +163,7 @@ programs.claude-desktop = {
 nix develop
 ```
 
-Provides: nodejs, python3, bubblewrap, electron_37, dmg2img, p7zip, prettier
+Provides: nodejs, python3, bubblewrap, electron_37, 7zz, prettier
 
 ### Building
 

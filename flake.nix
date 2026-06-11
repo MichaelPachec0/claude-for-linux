@@ -45,8 +45,7 @@
             src = claudeSrc;
 
             nativeBuildInputs = with pkgs; [
-              dmg2img
-              p7zip
+              _7zz
               python3
               nodejs
               perl
@@ -59,14 +58,18 @@
 
               echo "=== Extracting Claude Desktop ${claudeVersion} ==="
 
-              # Convert DMG to IMG
-              echo "[1/6] Converting DMG to IMG..."
-              dmg2img $src claude.img
-
-              # Extract with 7z
-              echo "[2/6] Extracting IMG..."
+              # Extract the app bundle straight from the DMG.
+              # Modern 7-Zip decompresses LZFSE-compressed UDIF images natively;
+              # dmg2img does not. Newer Claude DMGs (>= 1.118xx) are LZFSE-compressed,
+              # which dmg2img silently corrupts ("LZFSE block found, but no support is
+              # compiled in") so app.asar can never be located. The [3/6] find check
+              # below is the real failure guard, so tolerate 7-Zip's cosmetic HFS
+              # "Headers Error" warning on alternate streams.
+              echo "[1/6] Extracting DMG (LZFSE-aware 7-Zip)..."
               mkdir -p dmg-contents
-              7z x -y -odmg-contents claude.img > /dev/null 2>&1 || true
+              7zz x -y -odmg-contents $src > /dev/null 2>&1 || true
+
+              echo "[2/6] Extraction complete"
 
               # Find app.asar
               echo "[3/6] Locating app.asar..."
@@ -165,7 +168,7 @@
               # --- Patch 03: Availability check (regex) ---
               # Prepends Linux "supported" return before the platform check
               echo "[patch:03] Patching availability check..."
-              perl -i -pe 's{(function )(\w+)(\(\)\{)(const t=process\.platform;if\(t!=="darwin"&&t!=="win32"\)return\{status:"unsupported")}{$1$2$3if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};$4}g' "$INDEX"
+              perl -i -pe 's{(function )(\w+)(\(\)\{)(const (\w+)=process\.platform;if\(\5!=="darwin"&&\5!=="win32"\)return\{status:"unsupported")}{$1$2$3if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};$4}g' "$INDEX"
               grep -qP 'if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\}' "$INDEX" \
                 || { echo "ERROR: patch 03 (availability check) failed to apply"; exit 1; }
               echo "[patch:03] Done"
@@ -173,8 +176,8 @@
               # --- Patch 04: Skip download (regex) ---
               # Skips macOS VM bundle download on Linux
               echo "[patch:04] Patching download skip..."
-              perl -i -pe 's{(async function \w+\(t,e\)\{)(.{0,200}?\[downloadVM\])}{$1if(process.platform==="linux"\&\&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' "$INDEX"
-              grep -qP 'async function \w+\(t,e\)\{if\(process\.platform==="linux"' "$INDEX" \
+              perl -i -pe 's{(async function \w+\(\w+,\w+\)\{)(.{0,200}?\[downloadVM\])}{$1if(process.platform==="linux"\&\&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' "$INDEX"
+              grep -qP 'async function \w+\(\w+,\w+\)\{if\(process\.platform==="linux"' "$INDEX" \
                 || { echo "ERROR: patch 04 (skip download) failed to apply"; exit 1; }
               echo "[patch:04] Done"
 
@@ -208,7 +211,7 @@
               # --- Patch 08a: Tray icon resource path (regex) ---
               # Returns real filesystem path on Linux (COSMIC SNI can't read from ASAR)
               echo "[patch:08a] Patching tray icon resource path..."
-              perl -i -pe 's{function (\w+)\(\)\{return (\w+)\.app\.isPackaged\?(\w+)\.resourcesPath:(\w+)\.resolve\(__dirname,"\.\.","\.\.","resources"\)\}}{function $1(){return process.platform==="linux"?$4.join($4.dirname($2.app.getAppPath()),"resources"):$2.app.isPackaged?$3.resourcesPath:$4.resolve(__dirname,"..","..","resources")}}g' "$INDEX"
+              perl -i -pe 's{function ([\w\$]+)\(\)\{return (\w+)\.app\.isPackaged\?(\w+)\.resourcesPath:(\w+)\.resolve\(__dirname,"\.\.","\.\.","resources"\)\}}{function $1(){return process.platform==="linux"?$4.join($4.dirname($2.app.getAppPath()),"resources"):$2.app.isPackaged?$3.resourcesPath:$4.resolve(__dirname,"..","..","resources")}}g' "$INDEX"
               grep -qP 'process\.platform==="linux"\?\w+\.join\(\w+\.dirname\(' "$INDEX" \
                 || { echo "ERROR: patch 08a (tray icon path) failed to apply"; exit 1; }
               echo "[patch:08a] Done"
@@ -221,11 +224,30 @@
                 || { echo "ERROR: patch 08b (tray icon filename) failed to apply"; exit 1; }
               echo "[patch:08b] Done"
 
-              # --- Patch 09: DBus tray cleanup delay (regex) ---
-              # Prevents StatusNotifierItem registration race on Linux
-              echo "[patch:09] Patching tray DBus cleanup delay..."
-              perl -i -pe 's{(\w+)&&\(\1\.destroy\(\),\1=null\)}{$1&&($1.destroy(),$1=null,await new Promise(r=>setTimeout(r,250)))}g' "$INDEX"
-              echo "[patch:09] Done"
+              # --- Patch 09: DBus tray cleanup delay — REMOVED ---
+              # This patch inserted `await new Promise(r=>setTimeout(r,250))` after every
+              # `X&&(X.destroy(),X=null)` to space out StatusNotifierItem re-registration.
+              # As of 1.11847.5 that pattern also matches the VM client pipe teardown
+              # (I0/tQ/Iy in yMi()/SMi()) AND the tray itself (nE in HAe()) — all of which
+              # are now SYNCHRONOUS functions. Injecting `await` into a non-async function
+              # is a hard SyntaxError ("Unexpected token 'new'") that crashes the app at
+              # startup. The tray-race mitigation is cosmetic and cannot be expressed as a
+              # bare `await` here, so the patch is dropped. If the COSMIC tray race resurfaces,
+              # reintroduce it as a node-script patch that makes HAe() async (and updates its
+              # callers) rather than a blanket regex.
+
+              # --- Verify: every patched file must still be valid JavaScript ---
+              # A passing grep post-check only proves the *text* changed — not that the
+              # result parses. A regex that injects e.g. `await` into a now-synchronous
+              # function (as the old tray patch 09 did in 1.11847.5) builds fine but throws
+              # "SyntaxError: Unexpected token" at startup. `node --check` is the parser, so
+              # this turns that whole class of silent breakage into a hard build failure.
+              echo "[verify] Syntax-checking patched JavaScript..."
+              for jsfile in "$INDEX" "$MAINVIEW"; do
+                ${pkgs.nodejs}/bin/node --check "$jsfile" \
+                  || { echo "ERROR: $jsfile failed 'node --check' after patching (broken JS)"; exit 1; }
+              done
+              echo "[verify] Patched JavaScript parses cleanly"
 
               # Repack ASAR
               echo "[6/6] Repacking ASAR..."
@@ -459,8 +481,7 @@
               python3
               bubblewrap
               electron_37
-              dmg2img
-              p7zip
+              _7zz
 
               # Development tools
               nodePackages.prettier

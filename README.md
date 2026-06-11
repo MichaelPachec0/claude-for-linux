@@ -75,7 +75,7 @@ The `scripts/` directory contains older Ubuntu-specific scripts for Claude Deskt
 ```
 macOS DMG (fetchurl)
        |
-  dmg2img + 7z -> app.asar
+  7zz (LZFSE-aware) -> app.asar
        |
   asar_tool.py extract -> raw JS
        |
