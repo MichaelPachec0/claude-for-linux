@@ -224,6 +224,20 @@
                 || { echo "ERROR: patch 08b (tray icon filename) failed to apply"; exit 1; }
               echo "[patch:08b] Done"
 
+              # --- Patch 10: Claude Code (CCD) host platform (regex) ---
+              # The Claude Code-for-Desktop binary resolver's getHostPlatform() maps
+              # darwin/win32 to a target triple and throws "Unsupported platform" on anything
+              # else. On Linux that throw propagates up as "Failed to get commands from
+              # temporary query" (the local-binary override path is dead code in this build,
+              # so the throw is unavoidable otherwise). Teach it the linux targets — Anthropic
+              # ships linux CCD binaries (the macOS Cowork VM is itself Linux), so resolution
+              # can proceed via the normal preseed/download path instead of throwing.
+              echo "[patch:10] Patching Claude Code host platform..."
+              perl -i -pe 's{(getHostPlatform\(\)\{const (\w+)=process\.arch;if\(process\.platform==="darwin"\)return \2==="arm64"\?"darwin-arm64":"darwin-x64";if\(process\.platform==="win32"\)return \2==="arm64"\?"win32-arm64":"win32-x64";)}{$1if(process.platform==="linux")return $2==="arm64"?"linux-arm64":"linux-x64";}g' "$INDEX"
+              grep -qP 'if\(process\.platform==="linux"\)return \w+==="arm64"\?"linux-arm64":"linux-x64"' "$INDEX" \
+                || { echo "ERROR: patch 10 (CCD host platform) failed to apply"; exit 1; }
+              echo "[patch:10] Done"
+
               # --- Patch 09: DBus tray cleanup delay — REMOVED ---
               # This patch inserted `await new Promise(r=>setTimeout(r,250))` after every
               # `X&&(X.destroy(),X=null)` to space out StatusNotifierItem re-registration.
@@ -308,7 +322,9 @@
                 --add-flags "--no-sandbox" \
                 --add-flags "--ozone-platform-hint=auto" \
                 --add-flags "--class=Claude" \
+                --add-flags "--password-store=gnome-libsecret" \
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bubblewrap ]} \
+                --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libsecret ]} \
                 --set BWRAP_PATH "${pkgs.bubblewrap}/bin/bwrap" \
                 --set CHROME_DESKTOP "claude-desktop.desktop" \
                 --prefix XDG_DATA_DIRS : "$out/share"
@@ -345,6 +361,7 @@
               python3
               glibc
               openssl
+              libsecret          # Electron safeStorage backend (gnome-libsecret) for token persistence
               docker-client
               coreutils
               bash

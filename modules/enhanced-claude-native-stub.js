@@ -33,6 +33,13 @@ class ClaudeNativeLinux {
     return "10.0.0";
   }
 
+  getWindowsElevationType() {
+    // Patch 02 enables the Windows code path on Linux, so the app probes UAC
+    // elevation. Linux has no UAC — report the non-elevated default (callers treat
+    // "limited"/"full" as elevatable; "default" => can_elevate:false).
+    return "default";
+  }
+
   getOSVersion() {
     return os.release();
   }

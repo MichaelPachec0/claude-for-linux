@@ -54,6 +54,7 @@ See `docs/patching-architecture.md` for the full technical analysis.
 | 07 | Append IIFE | Replace "for Windows"/"for Mac" with "for Linux" |
 | 08 | `perl -pe` regex | Use theme-aware PNGs for tray icon |
 | 09 | — | **Removed** — injected `await` into now-synchronous fns (crash); see `flake.nix` |
+| 10 | `perl -pe` regex | Add Linux targets to Claude Code `getHostPlatform()` (was throwing) |
 
 ## Electron Gotchas
 
