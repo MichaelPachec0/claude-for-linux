@@ -355,6 +355,7 @@
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bubblewrap ]} \
                 --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libsecret ]} \
                 --set BWRAP_PATH "${pkgs.bubblewrap}/bin/bwrap" \
+                --set COWORK_SANDBOX_GLIBC "${pkgs.glibc}/lib" \
                 --set CHROME_DESKTOP "claude-desktop.desktop" \
                 --prefix XDG_DATA_DIRS : "$out/share"
 

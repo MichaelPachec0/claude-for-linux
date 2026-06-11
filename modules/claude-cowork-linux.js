@@ -211,6 +211,23 @@ class CoworkSessionManager {
       if (fs.existsSync(src)) bwrapArgs.push('--ro-bind', src, src);
     }
 
+    // The downloaded agent (Claude Code) is a dynamically-linked glibc ELF that
+    // expects /lib64/ld-linux-x86-64.so.2 + libc/libm/libpthread/libdl/librt,
+    // which NixOS does not place at those paths. The Nix wrapper points
+    // COWORK_SANDBOX_GLIBC at a glibc lib dir; bind it at /lib and /lib64 so such
+    // binaries can load. (Verified: the CCD binary needs only glibc, nothing else.)
+    const glibcLib = process.env.COWORK_SANDBOX_GLIBC;
+    if (glibcLib && fs.existsSync(glibcLib)) {
+      bwrapArgs.push('--ro-bind', glibcLib, '/lib', '--ro-bind', glibcLib, '/lib64');
+    }
+
+    // Make the command itself reachable: bind its directory read-only. The agent
+    // binary lives under the user's config dir, which is not otherwise exposed.
+    if (path.isAbsolute(command) && fs.existsSync(command)) {
+      const cmdDir = path.dirname(command);
+      bwrapArgs.push('--ro-bind', cmdDir, cmdDir);
+    }
+
     // Virtual file systems
     bwrapArgs.push(
       '--proc', '/proc',
