@@ -191,18 +191,24 @@ class CoworkSessionManager {
     const session = this.getSession(sessionId);
     const processId = randomUUID();
 
-    // Build bubblewrap arguments
-    const bwrapArgs = [
-      // Read-only system mounts
-      '--ro-bind', '/usr', '/usr',
-      '--ro-bind', '/lib', '/lib',
-      '--ro-bind', '/bin', '/bin',
-      '--ro-bind', '/sbin', '/sbin',
+    // Build bubblewrap arguments.
+    //
+    // Tight isolation: bind only what a sandboxed command actually needs, probing
+    // each source for existence (a missing --ro-bind source makes bwrap abort).
+    // On NixOS a store binary is self-contained under /nix/store (its ELF
+    // interpreter and libraries all resolve there), so the traditional FHS dirs
+    // /usr, /lib, /sbin are deliberately NOT exposed. Only widen this list when a
+    // tool genuinely needs a path — keep the sandbox surface minimal.
+    const bwrapArgs = [];
+    const roBinds = [
+      '/nix/store',                                            // binaries + interpreter + libs (essential on NixOS)
+      '/bin',                                                  // /bin/sh for shell shebangs
+      '/usr/bin/env',                                          // #!/usr/bin/env shebangs
+      '/etc/resolv.conf', '/etc/hosts', '/etc/nsswitch.conf',  // DNS (network namespace is shared, not unshared)
+      '/etc/ssl', '/etc/static', '/etc/pki',                   // TLS trust store (NixOS routes certs via /etc/ssl + /etc/static)
     ];
-
-    // Add lib64 if it exists (64-bit systems)
-    if (fs.existsSync('/lib64')) {
-      bwrapArgs.push('--ro-bind', '/lib64', '/lib64');
+    for (const src of roBinds) {
+      if (fs.existsSync(src)) bwrapArgs.push('--ro-bind', src, src);
     }
 
     // Virtual file systems
@@ -212,15 +218,16 @@ class CoworkSessionManager {
       '--tmpfs', '/tmp',
     );
 
-    // Bind mount session directory
-    bwrapArgs.push(
-      '--bind', session.mntDir, `/sessions/${sessionId}/mnt`,
-    );
-
-    // Add user mounts as read-write binds
+    // Expose the session mount tree. Bind each real directory directly under
+    // /sessions/<id>/mnt/<name> (bwrap creates the intermediate path). We do NOT
+    // bind session.mntDir itself: it holds host->path symlinks that addMount()
+    // creates for the main process's direct file access, which are meaningless
+    // inside the sandbox and would shadow these real binds (the symlink target
+    // isn't bound, so bwrap aborts with ENOENT).
+    const mntRoot = `/sessions/${sessionId}/mnt`;
+    bwrapArgs.push('--bind', session.outputsDir, `${mntRoot}/outputs`);
     for (const mount of session.mounts.values()) {
-      const vmPath = `/sessions/${sessionId}/mnt/${mount.name}`;
-      bwrapArgs.push('--bind', mount.hostPath, vmPath);
+      bwrapArgs.push('--bind', mount.hostPath, `${mntRoot}/${mount.name}`);
     }
 
     // Isolation flags
