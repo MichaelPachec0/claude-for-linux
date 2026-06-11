@@ -281,7 +281,7 @@
             nativeBuildInputs = [ pkgs.makeWrapper ];
             postBuild = ''
               mkdir -p $out/bin
-              makeWrapper ${pkgs.electron_37}/bin/electron $out/bin/claude-desktop \
+              makeWrapper ${pkgs.electron}/bin/electron $out/bin/claude-desktop \
                 --add-flags "$out/lib/claude-desktop/app.asar" \
                 --add-flags "--no-sandbox" \
                 --add-flags "--ozone-platform-hint=auto" \
