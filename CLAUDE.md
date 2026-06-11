@@ -55,6 +55,8 @@ See `docs/patching-architecture.md` for the full technical analysis.
 | 08 | `perl -pe` regex | Use theme-aware PNGs for tray icon |
 | 09 | — | **Removed** — injected `await` into now-synchronous fns (crash); see `flake.nix` |
 | 10 | `perl -pe` regex | Add Linux targets to Claude Code `getHostPlatform()` (was throwing) |
+| 11 | `perl -pe` regex | Resolve shell-env worker via `__dirname` (was using `process.resourcesPath`) |
+| 12 | `perl -pe` regex | Update tray image in place on Linux (stop StatusNotifierItem re-export spam) |
 
 ## Electron Gotchas
 

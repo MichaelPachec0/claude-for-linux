@@ -238,6 +238,35 @@
                 || { echo "ERROR: patch 10 (CCD host platform) failed to apply"; exit 1; }
               echo "[patch:10] Done"
 
+              # --- Patch 11: Shell-env worker path (regex) ---
+              # The shell-PATH extractor forks shellPathWorker.js, but resolves it relative to
+              # process.resourcesPath/app.asar (the standard packaged layout). Here app.asar
+              # lives at app.getAppPath(), not under Electron's resourcesPath, so the fork fails
+              # ("Shell path worker not found") and the app falls back to a bare process.env —
+              # losing the user's real PATH for MCP servers and Cowork tools. Resolve via
+              # __dirname (the asar dir of index.js) on Linux; the worker is forked from inside
+              # the asar just as it is on macOS.
+              echo "[patch:11] Patching shell-env worker path..."
+              perl -i -pe 's{function (\w+)\(\)\{return (\w+)\.join\(process\.resourcesPath,"app\.asar","\.vite","build","shell-path-worker","shellPathWorker\.js"\)\}}{function $1(){return process.platform==="linux"?$2.join(__dirname,"shell-path-worker","shellPathWorker.js"):$2.join(process.resourcesPath,"app.asar",".vite","build","shell-path-worker","shellPathWorker.js")}}g' "$INDEX"
+              grep -qP 'process\.platform==="linux"\?\w+\.join\(__dirname,"shell-path-worker","shellPathWorker\.js"\)' "$INDEX" \
+                || { echo "ERROR: patch 11 (shell-env worker path) failed to apply"; exit 1; }
+              echo "[patch:11] Done"
+
+              # --- Patch 12: Tray in-place update (regex) ---
+              # The single tray builder destroys and recreates the Tray on every call, and it's
+              # invoked several times during startup (helper-app-launched + nativeTheme "updated"
+              # + menuBarEnabled). Each new Tray re-exports the StatusNotifierItem / dbusmenu
+              # D-Bus objects before the destroyed one finishes deregistering, spamming
+              # "org.kde.StatusNotifierItem.* is already exported". On Linux, if a tray already
+              # exists and is still wanted, update its image in place and return instead of
+              # destroy+recreate (click handler and menu persist from first creation). This is
+              # the race the removed patch 09 targeted, fixed without an (illegal) await.
+              echo "[patch:12] Patching tray in-place update..."
+              perl -i -pe 's{((\w+)===void 0;)(if\(\2&&\(\2\.destroy\(\),\2=null\),!(\w+)\)\{\w+\(\);return\}\2=new (\w+)\.Tray\(\5\.nativeImage\.createFromPath\((\w+)\)\))}{$1if(process.platform==="linux"&&$2&&$4){$2.setImage($5.nativeImage.createFromPath($6));return}$3}g' "$INDEX"
+              grep -qP 'process\.platform==="linux"&&\w+&&\w+\)\{\w+\.setImage\(\w+\.nativeImage\.createFromPath\(\w+\)\);return\}' "$INDEX" \
+                || { echo "ERROR: patch 12 (tray in-place update) failed to apply"; exit 1; }
+              echo "[patch:12] Done"
+
               # --- Patch 09: DBus tray cleanup delay — REMOVED ---
               # This patch inserted `await new Promise(r=>setTimeout(r,250))` after every
               # `X&&(X.destroy(),X=null)` to space out StatusNotifierItem re-registration.
