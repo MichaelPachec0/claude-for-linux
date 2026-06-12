@@ -281,6 +281,22 @@ class CoworkSessionManager {
     // Command and arguments
     bwrapArgs.push(command, ...args);
 
+    // Debug: summarize the sandbox (no secrets — env is passed separately and not
+    // included; only paths/mount points are shown). Set COWORK_DEBUG=1 for the
+    // full bwrap argument list (host paths, still no env values).
+    console.log('[Cowork Linux] sandbox exec ' + JSON.stringify({
+      command,
+      argc: args.length,
+      cwd: options.cwd || null,
+      glibc: !!(glibcLib && fs.existsSync(glibcLib)),
+      home: sandboxHome,
+      mounts: Array.from(session.mounts.keys()),
+      additionalMounts: options.additionalMounts ? Object.keys(options.additionalMounts) : [],
+    }));
+    if (process.env.COWORK_DEBUG) {
+      console.log('[Cowork Linux] bwrap ' + bwrapArgs.join(' '));
+    }
+
     // Spawn the sandboxed process. Default HOME to the writable sandbox home so
     // the agent doesn't try to write to a non-existent host home path.
     const childEnv = { ...(options.env || process.env) };

@@ -125,13 +125,15 @@ const injection = `${declStr}
           const resolved=__resolveCommand(command||"claude");
           const procEnv=Object.assign({},process.env,env||{});
           if(oauthToken)procEnv.CLAUDE_CODE_OAUTH_TOKEN=oauthToken;
+          // Secret-safe spawn log: env KEYS and mount points only, never values/tokens.
+          console.log("[Cowork Linux] spawn "+JSON.stringify({id:id,name:name,command:command,resolved:resolved,args:args||[],cwd:cwd||null,oneShot:!!oneShot,hasOauthToken:!!oauthToken,envKeys:Object.keys(env||{}),mounts:additionalMounts?Object.keys(additionalMounts):[]}));
           const procInfo=manager.spawnSandboxed(sessionId,resolved,args||[],{cwd:cwd||void 0,env:procEnv,additionalMounts:additionalMounts||void 0,stdio:["pipe","pipe","pipe"]});
           const child=procInfo.child;
           const rec={id,proc:procInfo,running:true,exitCode:void 0};
           __procs.set(id,rec);
           if(child.stdout)child.stdout.on("data",d=>__emit("onStdout",id,d.toString()));
           if(child.stderr)child.stderr.on("data",d=>__emit("onStderr",id,d.toString()));
-          child.on("exit",(code,signal)=>{rec.running=false;rec.exitCode=code;__emit("onExit",id,code,signal||null,0)});
+          child.on("exit",(code,signal)=>{rec.running=false;rec.exitCode=code;console.log("[Cowork Linux] proc "+id+" exited code="+code+" signal="+(signal||"none"));__emit("onExit",id,code,signal||null,0)});
           child.on("error",err=>__emit("onError",id,String(err&&err.message||err),false));
           return Promise.resolve({id,processId:procInfo.id});
         },
