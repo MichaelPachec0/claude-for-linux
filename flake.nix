@@ -45,8 +45,7 @@
             src = claudeSrc;
 
             nativeBuildInputs = with pkgs; [
-              dmg2img
-              p7zip
+              _7zz
               python3
               nodejs
               perl
@@ -59,14 +58,18 @@
 
               echo "=== Extracting Claude Desktop ${claudeVersion} ==="
 
-              # Convert DMG to IMG
-              echo "[1/6] Converting DMG to IMG..."
-              dmg2img $src claude.img
-
-              # Extract with 7z
-              echo "[2/6] Extracting IMG..."
+              # Extract the app bundle straight from the DMG.
+              # Modern 7-Zip decompresses LZFSE-compressed UDIF images natively;
+              # dmg2img does not. Newer Claude DMGs (>= 1.118xx) are LZFSE-compressed,
+              # which dmg2img silently corrupts ("LZFSE block found, but no support is
+              # compiled in") so app.asar can never be located. The [3/6] find check
+              # below is the real failure guard, so tolerate 7-Zip's cosmetic HFS
+              # "Headers Error" warning on alternate streams.
+              echo "[1/6] Extracting DMG (LZFSE-aware 7-Zip)..."
               mkdir -p dmg-contents
-              7z x -y -odmg-contents claude.img > /dev/null 2>&1 || true
+              7zz x -y -odmg-contents $src > /dev/null 2>&1 || true
+
+              echo "[2/6] Extraction complete"
 
               # Find app.asar
               echo "[3/6] Locating app.asar..."
@@ -165,7 +168,7 @@
               # --- Patch 03: Availability check (regex) ---
               # Prepends Linux "supported" return before the platform check
               echo "[patch:03] Patching availability check..."
-              perl -i -pe 's{(function )(\w+)(\(\)\{)(const t=process\.platform;if\(t!=="darwin"&&t!=="win32"\)return\{status:"unsupported")}{$1$2$3if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};$4}g' "$INDEX"
+              perl -i -pe 's{(function )(\w+)(\(\)\{)(const (\w+)=process\.platform;if\(\5!=="darwin"&&\5!=="win32"\)return\{status:"unsupported")}{$1$2$3if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};$4}g' "$INDEX"
               grep -qP 'if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\}' "$INDEX" \
                 || { echo "ERROR: patch 03 (availability check) failed to apply"; exit 1; }
               echo "[patch:03] Done"
@@ -173,8 +176,8 @@
               # --- Patch 04: Skip download (regex) ---
               # Skips macOS VM bundle download on Linux
               echo "[patch:04] Patching download skip..."
-              perl -i -pe 's{(async function \w+\(t,e\)\{)(.{0,200}?\[downloadVM\])}{$1if(process.platform==="linux"\&\&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' "$INDEX"
-              grep -qP 'async function \w+\(t,e\)\{if\(process\.platform==="linux"' "$INDEX" \
+              perl -i -pe 's{(async function \w+\(\w+,\w+\)\{)(.{0,200}?\[downloadVM\])}{$1if(process.platform==="linux"\&\&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' "$INDEX"
+              grep -qP 'async function \w+\(\w+,\w+\)\{if\(process\.platform==="linux"' "$INDEX" \
                 || { echo "ERROR: patch 04 (skip download) failed to apply"; exit 1; }
               echo "[patch:04] Done"
 
@@ -208,7 +211,7 @@
               # --- Patch 08a: Tray icon resource path (regex) ---
               # Returns real filesystem path on Linux (COSMIC SNI can't read from ASAR)
               echo "[patch:08a] Patching tray icon resource path..."
-              perl -i -pe 's{function (\w+)\(\)\{return (\w+)\.app\.isPackaged\?(\w+)\.resourcesPath:(\w+)\.resolve\(__dirname,"\.\.","\.\.","resources"\)\}}{function $1(){return process.platform==="linux"?$4.join($4.dirname($2.app.getAppPath()),"resources"):$2.app.isPackaged?$3.resourcesPath:$4.resolve(__dirname,"..","..","resources")}}g' "$INDEX"
+              perl -i -pe 's{function ([\w\$]+)\(\)\{return (\w+)\.app\.isPackaged\?(\w+)\.resourcesPath:(\w+)\.resolve\(__dirname,"\.\.","\.\.","resources"\)\}}{function $1(){return process.platform==="linux"?$4.join($4.dirname($2.app.getAppPath()),"resources"):$2.app.isPackaged?$3.resourcesPath:$4.resolve(__dirname,"..","..","resources")}}g' "$INDEX"
               grep -qP 'process\.platform==="linux"\?\w+\.join\(\w+\.dirname\(' "$INDEX" \
                 || { echo "ERROR: patch 08a (tray icon path) failed to apply"; exit 1; }
               echo "[patch:08a] Done"
@@ -221,11 +224,73 @@
                 || { echo "ERROR: patch 08b (tray icon filename) failed to apply"; exit 1; }
               echo "[patch:08b] Done"
 
-              # --- Patch 09: DBus tray cleanup delay (regex) ---
-              # Prevents StatusNotifierItem registration race on Linux
-              echo "[patch:09] Patching tray DBus cleanup delay..."
-              perl -i -pe 's{(\w+)&&\(\1\.destroy\(\),\1=null\)}{$1&&($1.destroy(),$1=null,await new Promise(r=>setTimeout(r,250)))}g' "$INDEX"
-              echo "[patch:09] Done"
+              # --- Patch 10: Claude Code (CCD) host platform (regex) ---
+              # The Claude Code-for-Desktop binary resolver's getHostPlatform() maps
+              # darwin/win32 to a target triple and throws "Unsupported platform" on anything
+              # else. On Linux that throw propagates up as "Failed to get commands from
+              # temporary query" (the local-binary override path is dead code in this build,
+              # so the throw is unavoidable otherwise). Teach it the linux targets — Anthropic
+              # ships linux CCD binaries (the macOS Cowork VM is itself Linux), so resolution
+              # can proceed via the normal preseed/download path instead of throwing.
+              echo "[patch:10] Patching Claude Code host platform..."
+              perl -i -pe 's{(getHostPlatform\(\)\{const (\w+)=process\.arch;if\(process\.platform==="darwin"\)return \2==="arm64"\?"darwin-arm64":"darwin-x64";if\(process\.platform==="win32"\)return \2==="arm64"\?"win32-arm64":"win32-x64";)}{$1if(process.platform==="linux")return $2==="arm64"?"linux-arm64":"linux-x64";}g' "$INDEX"
+              grep -qP 'if\(process\.platform==="linux"\)return \w+==="arm64"\?"linux-arm64":"linux-x64"' "$INDEX" \
+                || { echo "ERROR: patch 10 (CCD host platform) failed to apply"; exit 1; }
+              echo "[patch:10] Done"
+
+              # --- Patch 11: Shell-env worker path (regex) ---
+              # The shell-PATH extractor forks shellPathWorker.js, but resolves it relative to
+              # process.resourcesPath/app.asar (the standard packaged layout). Here app.asar
+              # lives at app.getAppPath(), not under Electron's resourcesPath, so the fork fails
+              # ("Shell path worker not found") and the app falls back to a bare process.env —
+              # losing the user's real PATH for MCP servers and Cowork tools. Resolve via
+              # __dirname (the asar dir of index.js) on Linux; the worker is forked from inside
+              # the asar just as it is on macOS.
+              echo "[patch:11] Patching shell-env worker path..."
+              perl -i -pe 's{function (\w+)\(\)\{return (\w+)\.join\(process\.resourcesPath,"app\.asar","\.vite","build","shell-path-worker","shellPathWorker\.js"\)\}}{function $1(){return process.platform==="linux"?$2.join(__dirname,"shell-path-worker","shellPathWorker.js"):$2.join(process.resourcesPath,"app.asar",".vite","build","shell-path-worker","shellPathWorker.js")}}g' "$INDEX"
+              grep -qP 'process\.platform==="linux"\?\w+\.join\(__dirname,"shell-path-worker","shellPathWorker\.js"\)' "$INDEX" \
+                || { echo "ERROR: patch 11 (shell-env worker path) failed to apply"; exit 1; }
+              echo "[patch:11] Done"
+
+              # --- Patch 12: Tray in-place update (regex) ---
+              # The single tray builder destroys and recreates the Tray on every call, and it's
+              # invoked several times during startup (helper-app-launched + nativeTheme "updated"
+              # + menuBarEnabled). Each new Tray re-exports the StatusNotifierItem / dbusmenu
+              # D-Bus objects before the destroyed one finishes deregistering, spamming
+              # "org.kde.StatusNotifierItem.* is already exported". On Linux, if a tray already
+              # exists and is still wanted, update its image in place and return instead of
+              # destroy+recreate (click handler and menu persist from first creation). This is
+              # the race the removed patch 09 targeted, fixed without an (illegal) await.
+              echo "[patch:12] Patching tray in-place update..."
+              perl -i -pe 's{((\w+)===void 0;)(if\(\2&&\(\2\.destroy\(\),\2=null\),!(\w+)\)\{\w+\(\);return\}\2=new (\w+)\.Tray\(\5\.nativeImage\.createFromPath\((\w+)\)\))}{$1if(process.platform==="linux"&&$2&&$4){$2.setImage($5.nativeImage.createFromPath($6));return}$3}g' "$INDEX"
+              grep -qP 'process\.platform==="linux"&&\w+&&\w+\)\{\w+\.setImage\(\w+\.nativeImage\.createFromPath\(\w+\)\);return\}' "$INDEX" \
+                || { echo "ERROR: patch 12 (tray in-place update) failed to apply"; exit 1; }
+              echo "[patch:12] Done"
+
+              # --- Patch 09: DBus tray cleanup delay — REMOVED ---
+              # This patch inserted `await new Promise(r=>setTimeout(r,250))` after every
+              # `X&&(X.destroy(),X=null)` to space out StatusNotifierItem re-registration.
+              # As of 1.11847.5 that pattern also matches the VM client pipe teardown
+              # (I0/tQ/Iy in yMi()/SMi()) AND the tray itself (nE in HAe()) — all of which
+              # are now SYNCHRONOUS functions. Injecting `await` into a non-async function
+              # is a hard SyntaxError ("Unexpected token 'new'") that crashes the app at
+              # startup. The tray-race mitigation is cosmetic and cannot be expressed as a
+              # bare `await` here, so the patch is dropped. If the COSMIC tray race resurfaces,
+              # reintroduce it as a node-script patch that makes HAe() async (and updates its
+              # callers) rather than a blanket regex.
+
+              # --- Verify: every patched file must still be valid JavaScript ---
+              # A passing grep post-check only proves the *text* changed — not that the
+              # result parses. A regex that injects e.g. `await` into a now-synchronous
+              # function (as the old tray patch 09 did in 1.11847.5) builds fine but throws
+              # "SyntaxError: Unexpected token" at startup. `node --check` is the parser, so
+              # this turns that whole class of silent breakage into a hard build failure.
+              echo "[verify] Syntax-checking patched JavaScript..."
+              for jsfile in "$INDEX" "$MAINVIEW"; do
+                ${pkgs.nodejs}/bin/node --check "$jsfile" \
+                  || { echo "ERROR: $jsfile failed 'node --check' after patching (broken JS)"; exit 1; }
+              done
+              echo "[verify] Patched JavaScript parses cleanly"
 
               # Repack ASAR
               echo "[6/6] Repacking ASAR..."
@@ -286,8 +351,11 @@
                 --add-flags "--no-sandbox" \
                 --add-flags "--ozone-platform-hint=auto" \
                 --add-flags "--class=Claude" \
+                --add-flags "--password-store=gnome-libsecret" \
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bubblewrap ]} \
+                --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libsecret ]} \
                 --set BWRAP_PATH "${pkgs.bubblewrap}/bin/bwrap" \
+                --set COWORK_SANDBOX_GLIBC "${pkgs.glibc}/lib" \
                 --set CHROME_DESKTOP "claude-desktop.desktop" \
                 --prefix XDG_DATA_DIRS : "$out/share"
 
@@ -323,6 +391,7 @@
               python3
               glibc
               openssl
+              libsecret          # Electron safeStorage backend (gnome-libsecret) for token persistence
               docker-client
               coreutils
               bash
@@ -459,8 +528,7 @@
               python3
               bubblewrap
               electron_37
-              dmg2img
-              p7zip
+              _7zz
 
               # Development tools
               nodePackages.prettier

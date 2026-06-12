@@ -1,0 +1,55 @@
+name: CI
+
+# Build + verify the flake on every push and PR so a version bump (or a patch edit)
+# that breaks extraction or produces broken patched JavaScript is caught here, not
+# discovered at runtime. The auto-update workflow opens PRs that land on these checks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Flake check
+        run: nix flake check --print-build-logs
+
+      - name: Build all variants
+        run: |
+          nix build .#claude-app         --print-build-logs
+          nix build .#claude-desktop     --print-build-logs
+          nix build .#claude-desktop-fhs --print-build-logs
+
+      # Defence in depth. The flake already runs `node --check` on the patched JS during
+      # the build, but re-verify the packed app.asar here so a regression that weakens the
+      # in-build guard still can't pass CI. This is the check that catches the
+      # "build succeeds but the app crashes at startup with a SyntaxError" failure mode.
+      - name: Verify patched JS parses (smoke test)
+        run: |
+          out=$(nix build .#claude-app --no-link --print-out-paths)
+          dest="$RUNNER_TEMP/asar-extracted"
+          nix develop --command python3 tools/asar_tool.py extract \
+            "$out/lib/claude-desktop/app.asar" "$dest"
+          for f in index.js mainView.js; do
+            nix develop --command node --check "$dest/.vite/build/$f"
+            echo "$f: parses OK"
+          done

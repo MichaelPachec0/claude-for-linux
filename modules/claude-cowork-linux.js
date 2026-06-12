@@ -191,18 +191,41 @@ class CoworkSessionManager {
     const session = this.getSession(sessionId);
     const processId = randomUUID();
 
-    // Build bubblewrap arguments
-    const bwrapArgs = [
-      // Read-only system mounts
-      '--ro-bind', '/usr', '/usr',
-      '--ro-bind', '/lib', '/lib',
-      '--ro-bind', '/bin', '/bin',
-      '--ro-bind', '/sbin', '/sbin',
+    // Build bubblewrap arguments.
+    //
+    // Tight isolation: bind only what a sandboxed command actually needs, probing
+    // each source for existence (a missing --ro-bind source makes bwrap abort).
+    // On NixOS a store binary is self-contained under /nix/store (its ELF
+    // interpreter and libraries all resolve there), so the traditional FHS dirs
+    // /usr, /lib, /sbin are deliberately NOT exposed. Only widen this list when a
+    // tool genuinely needs a path — keep the sandbox surface minimal.
+    const bwrapArgs = [];
+    const roBinds = [
+      '/nix/store',                                            // binaries + interpreter + libs (essential on NixOS)
+      '/bin',                                                  // /bin/sh for shell shebangs
+      '/usr/bin/env',                                          // #!/usr/bin/env shebangs
+      '/etc/resolv.conf', '/etc/hosts', '/etc/nsswitch.conf',  // DNS (network namespace is shared, not unshared)
+      '/etc/ssl', '/etc/static', '/etc/pki',                   // TLS trust store (NixOS routes certs via /etc/ssl + /etc/static)
     ];
+    for (const src of roBinds) {
+      if (fs.existsSync(src)) bwrapArgs.push('--ro-bind', src, src);
+    }
 
-    // Add lib64 if it exists (64-bit systems)
-    if (fs.existsSync('/lib64')) {
-      bwrapArgs.push('--ro-bind', '/lib64', '/lib64');
+    // The downloaded agent (Claude Code) is a dynamically-linked glibc ELF that
+    // expects /lib64/ld-linux-x86-64.so.2 + libc/libm/libpthread/libdl/librt,
+    // which NixOS does not place at those paths. The Nix wrapper points
+    // COWORK_SANDBOX_GLIBC at a glibc lib dir; bind it at /lib and /lib64 so such
+    // binaries can load. (Verified: the CCD binary needs only glibc, nothing else.)
+    const glibcLib = process.env.COWORK_SANDBOX_GLIBC;
+    if (glibcLib && fs.existsSync(glibcLib)) {
+      bwrapArgs.push('--ro-bind', glibcLib, '/lib', '--ro-bind', glibcLib, '/lib64');
+    }
+
+    // Make the command itself reachable: bind its directory read-only. The agent
+    // binary lives under the user's config dir, which is not otherwise exposed.
+    if (path.isAbsolute(command) && fs.existsSync(command)) {
+      const cmdDir = path.dirname(command);
+      bwrapArgs.push('--ro-bind', cmdDir, cmdDir);
     }
 
     // Virtual file systems
@@ -212,15 +235,35 @@ class CoworkSessionManager {
       '--tmpfs', '/tmp',
     );
 
-    // Bind mount session directory
-    bwrapArgs.push(
-      '--bind', session.mntDir, `/sessions/${sessionId}/mnt`,
-    );
-
-    // Add user mounts as read-write binds
+    // Expose the session mount tree. Bind each real directory directly under
+    // /sessions/<id>/mnt/<name> (bwrap creates the intermediate path). We do NOT
+    // bind session.mntDir itself: it holds host->path symlinks that addMount()
+    // creates for the main process's direct file access, which are meaningless
+    // inside the sandbox and would shadow these real binds (the symlink target
+    // isn't bound, so bwrap aborts with ENOENT).
+    const mntRoot = `/sessions/${sessionId}/mnt`;
+    bwrapArgs.push('--bind', session.outputsDir, `${mntRoot}/outputs`);
     for (const mount of session.mounts.values()) {
-      const vmPath = `/sessions/${sessionId}/mnt/${mount.name}`;
-      bwrapArgs.push('--bind', mount.hostPath, vmPath);
+      bwrapArgs.push('--bind', mount.hostPath, `${mntRoot}/${mount.name}`);
+    }
+
+    // Writable per-session HOME — the agent writes its config/state here. Callers
+    // point HOME at SANDBOX_HOME via env (and CLAUDE_CONFIG_DIR underneath it).
+    const sandboxHome = '/home/cowork';
+    const homeHostDir = path.join(session.dir, 'home');
+    if (!fs.existsSync(homeHostDir)) fs.mkdirSync(homeHostDir, { recursive: true, mode: 0o700 });
+    bwrapArgs.push('--bind', homeHostDir, sandboxHome);
+
+    // Additional mounts requested by the caller: { guestPath: { path, mode } }.
+    // mode containing 'w' or 'd' => writable bind, else read-only. A relative
+    // guestPath is resolved under the sandbox HOME.
+    if (options.additionalMounts && typeof options.additionalMounts === 'object') {
+      for (const [guestPath, spec] of Object.entries(options.additionalMounts)) {
+        if (!spec || !spec.path || !fs.existsSync(spec.path)) continue;
+        const target = path.isAbsolute(guestPath) ? guestPath : path.posix.join(sandboxHome, guestPath);
+        const writable = typeof spec.mode === 'string' && /[wd]/.test(spec.mode);
+        bwrapArgs.push(writable ? '--bind' : '--ro-bind', spec.path, target);
+      }
     }
 
     // Isolation flags
@@ -238,10 +281,29 @@ class CoworkSessionManager {
     // Command and arguments
     bwrapArgs.push(command, ...args);
 
-    // Spawn the sandboxed process
+    // Debug: summarize the sandbox (no secrets — env is passed separately and not
+    // included; only paths/mount points are shown). Set COWORK_DEBUG=1 for the
+    // full bwrap argument list (host paths, still no env values).
+    console.log('[Cowork Linux] sandbox exec ' + JSON.stringify({
+      command,
+      argc: args.length,
+      cwd: options.cwd || null,
+      glibc: !!(glibcLib && fs.existsSync(glibcLib)),
+      home: sandboxHome,
+      mounts: Array.from(session.mounts.keys()),
+      additionalMounts: options.additionalMounts ? Object.keys(options.additionalMounts) : [],
+    }));
+    if (process.env.COWORK_DEBUG) {
+      console.log('[Cowork Linux] bwrap ' + bwrapArgs.join(' '));
+    }
+
+    // Spawn the sandboxed process. Default HOME to the writable sandbox home so
+    // the agent doesn't try to write to a non-existent host home path.
+    const childEnv = { ...(options.env || process.env) };
+    if (!childEnv.HOME) childEnv.HOME = sandboxHome;
     const child = spawn(BWRAP_PATH, bwrapArgs, {
       stdio: options.stdio || 'pipe',
-      env: options.env || process.env,
+      env: childEnv,
     });
 
     const procInfo = {
