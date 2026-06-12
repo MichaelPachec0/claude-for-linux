@@ -247,6 +247,25 @@ class CoworkSessionManager {
       bwrapArgs.push('--bind', mount.hostPath, `${mntRoot}/${mount.name}`);
     }
 
+    // Writable per-session HOME — the agent writes its config/state here. Callers
+    // point HOME at SANDBOX_HOME via env (and CLAUDE_CONFIG_DIR underneath it).
+    const sandboxHome = '/home/cowork';
+    const homeHostDir = path.join(session.dir, 'home');
+    if (!fs.existsSync(homeHostDir)) fs.mkdirSync(homeHostDir, { recursive: true, mode: 0o700 });
+    bwrapArgs.push('--bind', homeHostDir, sandboxHome);
+
+    // Additional mounts requested by the caller: { guestPath: { path, mode } }.
+    // mode containing 'w' or 'd' => writable bind, else read-only. A relative
+    // guestPath is resolved under the sandbox HOME.
+    if (options.additionalMounts && typeof options.additionalMounts === 'object') {
+      for (const [guestPath, spec] of Object.entries(options.additionalMounts)) {
+        if (!spec || !spec.path || !fs.existsSync(spec.path)) continue;
+        const target = path.isAbsolute(guestPath) ? guestPath : path.posix.join(sandboxHome, guestPath);
+        const writable = typeof spec.mode === 'string' && /[wd]/.test(spec.mode);
+        bwrapArgs.push(writable ? '--bind' : '--ro-bind', spec.path, target);
+      }
+    }
+
     // Isolation flags
     bwrapArgs.push(
       '--unshare-pid',     // Separate process namespace
@@ -262,10 +281,13 @@ class CoworkSessionManager {
     // Command and arguments
     bwrapArgs.push(command, ...args);
 
-    // Spawn the sandboxed process
+    // Spawn the sandboxed process. Default HOME to the writable sandbox home so
+    // the agent doesn't try to write to a non-existent host home path.
+    const childEnv = { ...(options.env || process.env) };
+    if (!childEnv.HOME) childEnv.HOME = sandboxHome;
     const child = spawn(BWRAP_PATH, bwrapArgs, {
       stdio: options.stdio || 'pipe',
-      env: options.env || process.env,
+      env: childEnv,
     });
 
     const procInfo = {

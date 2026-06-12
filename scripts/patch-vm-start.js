@@ -82,31 +82,65 @@ const injection = `${declStr}
     const {manager}=global.__linuxCowork;
     try {
       const {randomUUID}=require('crypto');
+      const nodePath=require('path');
+      const nodeFs=require('fs');
       const sessionId=randomUUID();
       manager.createSession(sessionId);
       console.log("[Cowork Linux] Session created:",sessionId);
+      // Process event sink (installed by the app via setEventCallbacks) and a
+      // per-id process registry so writeStdin/kill/isProcessRunning work by id.
+      let __cbs={};
+      const __procs=new Map();
+      const __emit=(name,...a)=>{try{if(typeof __cbs[name]==="function")__cbs[name](...a)}catch(e){}};
+      // The app spawns the agent as the bare command "claude"; resolve it to the
+      // downloaded CCD binary under userData (prefer a .verified version).
+      const __resolveCommand=(cmd)=>{
+        if(cmd!=="claude")return cmd;
+        try{
+          const base=nodePath.join(oA.app.getPath("userData"),"claude-code");
+          const vers=nodeFs.readdirSync(base).filter(d=>{try{return nodeFs.existsSync(nodePath.join(base,d,"claude"))}catch(e){return false}}).sort();
+          const pick=vers.slice().reverse().find(d=>nodeFs.existsSync(nodePath.join(base,d,".verified")))||vers[vers.length-1];
+          if(pick)return nodePath.join(base,pick,"claude");
+        }catch(e){console.error("[Cowork Linux] claude binary resolve failed:",e.message)}
+        return cmd;
+      };
       const vmInstance={
         sessionId,
         isConnected:()=>true,
         isGuestConnected:()=>Promise.resolve(true),
-        isProcessRunning:(name)=>Promise.resolve(name==="__heartbeat_ping__"),
+        isProcessRunning:(id)=>{
+          if(id==="__heartbeat_ping__")return Promise.resolve({running:true});
+          const r=__procs.get(id);
+          return Promise.resolve({running:!!(r&&r.running),exitCode:r?r.exitCode:void 0});
+        },
         startVM:async()=>{},
         stopVM:async()=>{},
         installSdk:async()=>{},
-        setEventCallbacks:()=>{},
-        executeCommand:(cmd)=>manager.spawnSandboxed(sessionId,cmd.command,cmd.args||[]),
+        setEventCallbacks:(onStdout,onStderr,onExit,onError,onNetworkStatus,onApiReachability,onStartupStep)=>{
+          __cbs={onStdout,onStderr,onExit,onError,onNetworkStatus,onApiReachability,onStartupStep};
+        },
+        // Full VM-client spawn signature:
+        // id,name,command,args,cwd,env,additionalMounts,isResume,allowedDomains,oneShot,mountSkeletonHome,oauthToken
+        spawn:(id,name,command,args,cwd,env,additionalMounts,isResume,allowedDomains,oneShot,mountSkeletonHome,oauthToken)=>{
+          const resolved=__resolveCommand(command||"claude");
+          const procEnv=Object.assign({},process.env,env||{});
+          if(oauthToken)procEnv.CLAUDE_CODE_OAUTH_TOKEN=oauthToken;
+          const procInfo=manager.spawnSandboxed(sessionId,resolved,args||[],{cwd:cwd||void 0,env:procEnv,additionalMounts:additionalMounts||void 0,stdio:["pipe","pipe","pipe"]});
+          const child=procInfo.child;
+          const rec={id,proc:procInfo,running:true,exitCode:void 0};
+          __procs.set(id,rec);
+          if(child.stdout)child.stdout.on("data",d=>__emit("onStdout",id,d.toString()));
+          if(child.stderr)child.stderr.on("data",d=>__emit("onStderr",id,d.toString()));
+          child.on("exit",(code,signal)=>{rec.running=false;rec.exitCode=code;__emit("onExit",id,code,signal||null,0)});
+          child.on("error",err=>__emit("onError",id,String(err&&err.message||err),false));
+          return Promise.resolve({id,processId:procInfo.id});
+        },
+        writeStdin:(id,data)=>{const r=__procs.get(id);if(r&&r.proc.child&&r.proc.child.stdin)try{r.proc.child.stdin.write(data)}catch(e){}return Promise.resolve()},
+        kill:(id,signal)=>{const r=__procs.get(id);if(r&&r.proc.child&&!r.proc.child.killed)try{r.proc.child.kill(signal||"SIGTERM")}catch(e){}return Promise.resolve()},
+        executeCommand:(cmd)=>manager.spawnSandboxed(sessionId,__resolveCommand(cmd.command),cmd.args||[]),
         addMount:(hostPath)=>manager.addMount(sessionId,hostPath),
         dispose:()=>{manager.destroySession(sessionId);delete global.__linuxCowork.vmInstance},
         addApprovedOauthToken:()=>Promise.resolve(),
-        spawn:(command,args)=>{
-          const procInfo=manager.spawnSandboxed(sessionId,command,args||[]);
-          const child=procInfo.child;
-          return new Proxy(child,{get(target,prop){
-            if(prop==='writeStdin')return(data)=>{if(target.stdin)target.stdin.write(data)};
-            if(prop==='processId')return procInfo.id;
-            const val=target[prop];return typeof val==='function'?val.bind(target):val;
-          }});
-        },
         exec:(command)=>manager.spawnSandboxed(sessionId,'/bin/sh',['-c',command]),
         mkdir:()=>Promise.resolve(),
         readFile:(p,enc)=>Promise.resolve(require('fs').readFileSync(p,enc||'utf8')),
