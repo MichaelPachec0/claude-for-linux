@@ -25,6 +25,13 @@
         let
           pkgs = nixpkgs.legacyPackages.${system};
 
+          # Real glibc dynamic loader, used to run Anthropic's generic-Linux Claude Code
+          # binary on NixOS (its baked /lib64/ld-linux interpreter is a NixOS stub). See
+          # patch 16 + scripts/ccd-ld-wrap.js.
+          glibcLdso = "${pkgs.glibc}/lib/${
+            if system == "aarch64-linux" then "ld-linux-aarch64.so.1" else "ld-linux-x86-64.so.2"
+          }";
+
           # Fetch macOS DMG
           claudeSrc = pkgs.fetchurl {
             url = claudeDmgUrl;
@@ -157,19 +164,28 @@
               cat ${./scripts/cowork-init.js} >> "$INDEX"
               echo "[patch:01] Done"
 
-              # --- Patch 02: Platform flag (regex) ---
-              # Makes the Windows platform flag also true on Linux, routing through TS VM path
-              echo "[patch:02] Patching platform flag..."
-              perl -i -pe 's{(\w+=process\.platform==="darwin",)(\w+)(=process\.platform==="win32")}{$1$2$3||process.platform==="linux"}g' "$INDEX"
-              grep -qP '\w+=process\.platform==="win32"\|\|process\.platform==="linux"' "$INDEX" \
-                || { echo "ERROR: patch 02 (platform flag) failed to apply"; exit 1; }
-              echo "[patch:02] Done"
+              # --- Patch 02: Platform flag — REMOVED ---
+              # Historically this flipped the Windows VM-client flag true on Linux so the
+              # app would route through the TypeScript/IPC VM path instead of @ant/claude-swift.
+              # As of 1.13576.0 Anthropic dropped the Windows VM client entirely: there is a
+              # single Swift loader (B_t()/qo()) and the availability check (S3i/Hce, patch 03)
+              # hardcodes "darwin" with no win32 branch left to piggyback on — so the old
+              # `X=process.platform==="darwin",Y=process.platform==="win32"` pair no longer
+              # exists. The routing job this patch did is now fully covered by patch 03
+              # (make availability "supported" on Linux) plus patch 06a (return the Linux VM
+              # instance from the getter before the Swift module is ever touched). Dropped.
 
               # --- Patch 03: Availability check (regex) ---
-              # Prepends Linux "supported" return before the platform check
+              # The Cowork capability check (S3i, reached via Hce()/X_().yukonSilver) hardcodes
+              # `const A="darwin",e=process.arch` then probes the macOS version and
+              # `require("@ant/claude-swift").vm.isVirtualizationSupported()` — all of which
+              # fail (or throw) on Linux. Short-circuit it: when global.__linuxCowork is live,
+              # return {status:"supported"} before any darwin/Swift logic runs. Hce() then flows
+              # through the platform-agnostic enterprise gating to Vj({status:"supported"}),
+              # so both the sync (X_()) and async (o0A()) availability paths report supported.
               echo "[patch:03] Patching availability check..."
-              perl -i -pe 's{(function )(\w+)(\(\)\{)(const (\w+)=process\.platform;if\(\5!=="darwin"&&\5!=="win32"\)return\{status:"unsupported")}{$1$2$3if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};$4}g' "$INDEX"
-              grep -qP 'if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\}' "$INDEX" \
+              perl -i -pe 's{(function \w+\(\)\{var \w+;const \w+="darwin",\w+=process\.arch;)}{$1if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};}g' "$INDEX"
+              grep -qP 'const \w+="darwin",\w+=process\.arch;if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\}' "$INDEX" \
                 || { echo "ERROR: patch 03 (availability check) failed to apply"; exit 1; }
               echo "[patch:03] Done"
 
@@ -217,10 +233,15 @@
               echo "[patch:08a] Done"
 
               # --- Patch 08b: Tray icon filename (regex) ---
-              # Linux uses theme-aware PNGs instead of Windows ICOs
+              # Linux uses theme-aware PNGs instead of Windows ICOs. The filename is now chosen
+              # by `switch(Y1r){case"ico":...;case"template-image":e="TrayIconTemplate.png";...}`
+              # where Y1r is hardcoded "template-image" — a flat (non-theme-aware) icon that
+              # won't adapt to a dark panel on Linux. Rewrite only the template-image case so
+              # Linux picks the dark/light PNG by nativeTheme (matching the existing "png" case),
+              # while macOS keeps its OS-adapted template image untouched.
               echo "[patch:08b] Patching tray icon filename selection..."
-              perl -i -pe 's{(\w+)\?(\w+)=(\w+)\.nativeTheme\.shouldUseDarkColors\?"Tray-Win32-Dark\.ico":"Tray-Win32\.ico":(\w+)="TrayIconTemplate\.png"}{process.platform==="linux"?($2=$3.nativeTheme.shouldUseDarkColors?"TrayIconTemplate-Dark.png":"TrayIconTemplate.png"):$1?$2=$3.nativeTheme.shouldUseDarkColors?"Tray-Win32-Dark.ico":"Tray-Win32.ico":$4="TrayIconTemplate.png"}g' "$INDEX"
-              grep -qP 'process\.platform==="linux"\?\(' "$INDEX" \
+              perl -i -pe 's{(switch\(\w+\)\{case"ico":\w+=(\w+)\.nativeTheme\.shouldUseDarkColors\?"Tray-Win32-Dark\.ico":"Tray-Win32\.ico";break;case"template-image":)(\w+)="TrayIconTemplate\.png";break}{$1$3=process.platform==="linux"?($2.nativeTheme.shouldUseDarkColors?"TrayIconTemplate-Dark.png":"TrayIconTemplate.png"):"TrayIconTemplate.png";break}g' "$INDEX"
+              grep -qP 'case"template-image":\w+=process\.platform==="linux"\?\(\w+\.nativeTheme\.shouldUseDarkColors\?"TrayIconTemplate-Dark\.png"' "$INDEX" \
                 || { echo "ERROR: patch 08b (tray icon filename) failed to apply"; exit 1; }
               echo "[patch:08b] Done"
 
@@ -261,11 +282,83 @@
               # exists and is still wanted, update its image in place and return instead of
               # destroy+recreate (click handler and menu persist from first creation). This is
               # the race the removed patch 09 targeted, fixed without an (illegal) await.
+              # The builder now computes the image path first (`const t=join(dir(),e)`), then
+              # runs `if(OQ&&(OQ.destroy(),OQ=null),!A){...return}OQ=new Tray(...createFromPath(t))`.
+              # Inject the Linux in-place update before that destroy/recreate, while the old
+              # tray (OQ) is still live: if it exists and is still wanted (A), setImage and return.
               echo "[patch:12] Patching tray in-place update..."
-              perl -i -pe 's{((\w+)===void 0;)(if\(\2&&\(\2\.destroy\(\),\2=null\),!(\w+)\)\{\w+\(\);return\}\2=new (\w+)\.Tray\(\5\.nativeImage\.createFromPath\((\w+)\)\))}{$1if(process.platform==="linux"&&$2&&$4){$2.setImage($5.nativeImage.createFromPath($6));return}$3}g' "$INDEX"
+              perl -i -pe 's{(const (\w+)=\w+\.join\([\w\$]+\(\),\w+\);)(if\((\w+)&&\(\4\.destroy\(\),\4=null\),!(\w+)\)\{[\w\$]+\(\);return\}\4=new (\w+)\.Tray\(\6\.nativeImage\.createFromPath\(\2\)\))}{$1if(process.platform==="linux"&&$4&&$5){$4.setImage($6.nativeImage.createFromPath($2));return}$3}g' "$INDEX"
               grep -qP 'process\.platform==="linux"&&\w+&&\w+\)\{\w+\.setImage\(\w+\.nativeImage\.createFromPath\(\w+\)\);return\}' "$INDEX" \
                 || { echo "ERROR: patch 12 (tray in-place update) failed to apply"; exit 1; }
               echo "[patch:12] Done"
+
+              # --- Patch 13: macOS-only systemPreferences.setUserDefault guard (regex) ---
+              # Top-level app init unconditionally calls
+              # `systemPreferences.setUserDefault("NSAutoFillHeuristicsEnabled","boolean",!1)`.
+              # setUserDefault is a macOS-only Electron API; on Linux it's undefined, so the
+              # call throws "setUserDefault is not a function" during module load and the app
+              # crashes at startup. Gate it behind a darwin check (`&&` short-circuits on Linux,
+              # leaving the trailing comma-sequence — e.g. ...,GCo() — to run untouched). The
+              # other systemPreferences.* calls are already darwin-gated or runtime/try-catch'd.
+              echo "[patch:13] Patching systemPreferences.setUserDefault guard..."
+              perl -i -pe 's{(\w+)\.systemPreferences\.setUserDefault\(}{process.platform==="darwin"\&\&$1.systemPreferences.setUserDefault(}g' "$INDEX"
+              grep -qP 'process\.platform==="darwin"&&\w+\.systemPreferences\.setUserDefault\(' "$INDEX" \
+                || { echo "ERROR: patch 13 (setUserDefault guard) failed to apply"; exit 1; }
+              echo "[patch:13] Done"
+
+              # --- Patch 14: macOS-only app.configureWebAuthn guard (regex) ---
+              # The same top-level init (right after setUserDefault) calls GCo(), whose entire
+              # body is `app.configureWebAuthn({touchID:{keychainAccessGroup:...}})`. That Touch
+              # ID WebAuthn config is macOS-only; configureWebAuthn is absent on Linux's Electron,
+              # so it throws "configureWebAuthn is not a function" at module load — the next
+              # startup crash after patch 13. Gate it behind a darwin check (Anthropic ships it
+              # working on macOS; on Linux the `&&` short-circuits to a no-op).
+              echo "[patch:14] Patching app.configureWebAuthn guard..."
+              perl -i -pe 's{(\w+)\.app\.configureWebAuthn\(}{process.platform==="darwin"\&\&$1.app.configureWebAuthn(}g' "$INDEX"
+              grep -qP 'process\.platform==="darwin"&&\w+\.app\.configureWebAuthn\(' "$INDEX" \
+                || { echo "ERROR: patch 14 (configureWebAuthn guard) failed to apply"; exit 1; }
+              echo "[patch:14] Done"
+
+              # --- Patch 15: macOS-only BrowserWindow method guards (regex) ---
+              # Two BrowserWindow instance methods are macOS-only and absent on Linux's Electron,
+              # so they throw "X is not a function" when their window is created/updated:
+              #   15a setWindowButtonPosition — positions the traffic-light buttons (called from
+              #       the zoom-factor handler on the main window).
+              #   15b setHiddenInMissionControl — one call (the quick-entry window) is unguarded;
+              #       the other two sites are already `process.platform==="darwin"&&`-gated.
+              # Convert both to optional-call (`method?.(...)`) — the idiom the app itself uses for
+              # platform-optional methods (e.g. `app.dock?.bounce`). On macOS the method exists and
+              # runs; on Linux it short-circuits to a no-op. The already-darwin-gated
+              # setHiddenInMissionControl sites are unaffected (method still exists on macOS).
+              echo "[patch:15a] Patching setWindowButtonPosition..."
+              perl -i -pe 's{(\.setWindowButtonPosition)\(}{$1?.(}g' "$INDEX"
+              grep -qP '\.setWindowButtonPosition\?\.\(' "$INDEX" \
+                || { echo "ERROR: patch 15a (setWindowButtonPosition) failed to apply"; exit 1; }
+              echo "[patch:15a] Done"
+
+              echo "[patch:15b] Patching setHiddenInMissionControl..."
+              perl -i -pe 's{(\.setHiddenInMissionControl)\(}{$1?.(}g' "$INDEX"
+              grep -qP '\.setHiddenInMissionControl\?\.\(' "$INDEX" \
+                || { echo "ERROR: patch 15b (setHiddenInMissionControl) failed to apply"; exit 1; }
+              echo "[patch:15b] Done"
+
+              # --- Patch 16: Claude Code native-binary loader shim (append) ---
+              # The downloaded CCD binary (<userData>/claude-code/<ver>/claude) is a generic-Linux
+              # ELF whose interpreter /lib64/ld-linux-x86-64.so.2 is a NixOS stub, so the SDK's
+              # spawn fails with "native binary ... exists but failed to launch" (ENOENT on the
+              # missing interpreter). The append installs global __claudeCcdLdWrap() (returns
+              # [ld.so, ["--argv0",bin,bin,...args]] for ELFs under /claude-code/, else the command
+              # unchanged) and monkeypatches child_process spawn/spawnSync/execFile/execFileSync to
+              # route those launches through a real glibc loader, whichever SDK path is used. The
+              # loader path is baked from pkgs.glibc. Works for the default AND fhs variants.
+              echo "[patch:16] Installing Claude Code loader shim..."
+              cat ${./scripts/ccd-ld-wrap.js} >> "$INDEX"
+              perl -i -pe 's{__CLAUDE_LDSO__}{${glibcLdso}}g' "$INDEX"
+              grep -qF '${glibcLdso}' "$INDEX" && ! grep -qF '__CLAUDE_LDSO__' "$INDEX" \
+                || { echo "ERROR: patch 16 loader path substitution failed"; exit 1; }
+              grep -qF '__claudeCcdWrapped' "$INDEX" \
+                || { echo "ERROR: patch 16 (loader shim append) failed to apply"; exit 1; }
+              echo "[patch:16] Done"
 
               # --- Patch 09: DBus tray cleanup delay — REMOVED ---
               # This patch inserted `await new Promise(r=>setTimeout(r,250))` after every

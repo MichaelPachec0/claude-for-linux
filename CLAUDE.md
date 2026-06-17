@@ -46,8 +46,8 @@ See `docs/patching-architecture.md` for the full technical analysis.
 |---|--------|---------|
 | 00 | File copy | Electron API stubs for Linux (`@ant/claude-native`) |
 | 01 | Append IIFE | Load bubblewrap Cowork module |
-| 02 | `perl -pe` regex | Route Linux through VM path (platform flag) |
-| 03 | `perl -pe` regex | Return "supported" for Linux availability |
+| 02 | — | **Removed** — win32 VM-client path dropped upstream (1.13576.0); job now covered by 03 + 06a; see `flake.nix` |
+| 03 | `perl -pe` regex | Return "supported" for Linux availability (anchored on the `="darwin",process.arch` capability check) |
 | 04 | `perl -pe` regex | Skip macOS VM bundle download |
 | 05 | Node.js dynamic | Create bubblewrap session at VM start |
 | 06 | `perl -pe` regex | Return Linux VM instance from getters |
@@ -57,6 +57,10 @@ See `docs/patching-architecture.md` for the full technical analysis.
 | 10 | `perl -pe` regex | Add Linux targets to Claude Code `getHostPlatform()` (was throwing) |
 | 11 | `perl -pe` regex | Resolve shell-env worker via `__dirname` (was using `process.resourcesPath`) |
 | 12 | `perl -pe` regex | Update tray image in place on Linux (stop StatusNotifierItem re-export spam) |
+| 13 | `perl -pe` regex | Gate macOS-only `systemPreferences.setUserDefault` behind a darwin check (was crashing at startup) |
+| 14 | `perl -pe` regex | Gate macOS-only `app.configureWebAuthn` (Touch ID WebAuthn) behind a darwin check (was crashing at startup) |
+| 15 | `perl -pe` regex | Optional-call macOS-only BrowserWindow methods `setWindowButtonPosition` / `setHiddenInMissionControl` (were crashing on window setup) |
+| 16 | Append IIFE | Run the downloaded Claude Code (CCD) binary via the Nix glibc loader (its `/lib64/ld-linux` is a NixOS stub) + fall back to `$HOME` when a spawn cwd doesn't exist (stale macOS project paths) |
 
 ## Electron Gotchas
 
