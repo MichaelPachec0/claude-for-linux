@@ -40,8 +40,8 @@ indexContent = indexContent.replace(original, replacement);
 |---|---------|------------------|-----------------------|
 | 00 | Native module stub | `@ant/claude-native/index.js` (whole file replacement) | No |
 | 01 | Cowork module loader | Appends to end of `index.js` | No |
-| 02 | Platform flag | `VAR=process.platform==="win32"` → add `\|\|"linux"` | **Yes** — variable name |
-| 03 | Availability check | `function NAME(){...platform..."unsupported"}` → prepend Linux return | **Yes** — function name |
+| 02 | Platform flag | **Removed** in 1.13576.0 — the `darwin`/`win32` flag pair (Windows VM client) was deleted upstream; routing is now handled by patch 03 + 06a | n/a |
+| 03 | Availability check | `function NAME(){var V;const V="darwin",V=process.arch;...}` → prepend Linux `{status:"supported"}` return | **Yes** — anchored on the `="darwin",process.arch` capability check |
 | 04 | Skip download | `async function NAME(VAR,VAR){...[downloadVM]` → prepend Linux early-return | **Yes** — function name + params |
 | 05 | VM start intercept | `async function NAME(VAR,VAR,VAR,VAR){...[VM:start]` → prepend Linux bubblewrap session | **Yes** — function name + ~6 internal refs |
 | 06 | VM getter override | Two small functions → prepend Linux VM return | **Yes** — function names + inner call |
@@ -103,12 +103,13 @@ Even when doing manual updates, the key insight is that **each function has a st
 ```bash
 INDEX=/path/to/extracted/.vite/build/index.js
 
-# Patch 02: Platform flag — the darwin,win32 pair near a combined OR check
-grep -oP '.{0,60}process\.platform==="darwin",.{0,4}=process\.platform==="win32".{0,20}' $INDEX
+# Patch 02: REMOVED in 1.13576.0 — the darwin/win32 platform-flag pair (the Windows
+# VM client) no longer exists; the capability check below hardcodes "darwin" instead.
 
-# Patch 03: Availability check — the function that returns {status:"unsupported"}
-# (the platform var is minified; capture it generically rather than hardcoding `t`)
-grep -oP 'function \w+\(\)\{const \w+=process\.platform;if\(\w+!=="darwin"&&\w+!=="win32"\)return\{status:"unsupported"' $INDEX
+# Patch 03: Availability check — the platform/arch capability check (reached via the
+# yukonSilver feature getter). It hardcodes `const X="darwin",Y=process.arch` then probes
+# the macOS version + @ant/claude-swift; we short-circuit it with a Linux supported return.
+grep -oP 'function \w+\(\)\{var \w+;const \w+="darwin",\w+=process\.arch;' $INDEX
 
 # Patch 04: Download guard — the async function near [downloadVM] log messages
 # (params are minified, e.g. (A,e); the verify regex uses \(\w+,\w+\), not literal (t,e))
@@ -129,11 +130,28 @@ grep -oP 'async function \w+\(\)\{return process\.platform!=="darwin"\?null:awai
 # Patch 08a: Resource path — returns resourcesPath or __dirname resolve
 grep -oP 'function \w+\(\)\{return \w+\.app\.isPackaged\?\w+\.resourcesPath:\w+\.resolve\(__dirname,"\.\.","\.\.","resources"\)\}' $INDEX
 
-# Patch 08b: Tray icon filename — the Win32 ICO ternary
-grep -oP '\w+\?\w+=\w+\.nativeTheme\.shouldUseDarkColors\?"Tray-Win32-Dark\.ico":"Tray-Win32\.ico":\w+="TrayIconTemplate\.png"' $INDEX
+# Patch 08b: Tray icon filename — the icon-name switch (was a ternary pre-1.13576.0,
+# now `switch(FLAG){case"ico":...;case"template-image":VAR="TrayIconTemplate.png";...}`).
+# We rewrite the template-image case to pick a theme-aware PNG on Linux.
+grep -oP 'switch\(\w+\)\{case"ico":\w+=\w+\.nativeTheme\.shouldUseDarkColors\?"Tray-Win32-Dark\.ico":"Tray-Win32\.ico";break;case"template-image":\w+="TrayIconTemplate\.png"' $INDEX
+
+# Patches 13-15: macOS/Windows-only Electron APIs that are ABSENT on Linux's electron_37
+# and throw "X is not a function". These accumulate as Anthropic adds native integrations,
+# so re-scan on every bump. setProgressBar/setIcon/dock.* are cross-platform or already
+# optional-chained — only the genuinely macOS-only ones called UNGUARDED need patching.
+grep -oP '\w+\.systemPreferences\.setUserDefault\(' $INDEX                 # patch 13 (darwin guard)
+grep -oP '\w+\.app\.configureWebAuthn\(' $INDEX                            # patch 14 (darwin guard)
+grep -oP '\w+\.setWindowButtonPosition\(' $INDEX                           # patch 15a (optional-call)
+grep -oP '\w+\.setHiddenInMissionControl\(' $INDEX                         # patch 15b (optional-call; 1 of 3 sites unguarded)
+# General sweep for the next one that breaks — list every macOS-only method call and
+# eyeball which lack a `process.platform==="darwin"` / `m6()` guard or a `?.` optional-call:
+grep -oP '\.(setActivationPolicy|setSecureKeyboardEntryEnabled|setWindowButtonVisibility|getUserDefault|setUserActivity|setVibrancy|setRepresentedFilename|moveToApplicationsFolder)\(' $INDEX
 ```
 
-These patterns have been stable across v2685, v2998, and v3189.
+Patches 00-12 have been stable across v2685, v2998, v3189; the 1.13576.0 refactor dropped
+patch 02 and reworked 03/08b/12 (see the patch-difficulty table above). Patches 13-15 were
+added for 1.13576.0's new macOS-native call sites (Touch ID WebAuthn, traffic-light
+positioning, Mission Control hiding) that crash at startup/window-setup on Linux.
 
 ## Toward Automated Patching
 
@@ -145,7 +163,7 @@ Replace the 6 identifier-dependent Node.js patches with `perl -pe` substitutions
 
 | Patch | Regex conversion difficulty | Notes |
 |-------|----------------------------|-------|
-| 02 (platform flag) | Easy | `s{(\w+)=process\.platform==="win32"(,\w+=\w+\|\|\w+)}{$1=process.platform==="win32"\|\|process.platform==="linux"$2}` — match the darwin/win32 pair context |
+| 02 (platform flag) | Removed | The win32 VM client was dropped upstream in 1.13576.0; patch 03 + 06a cover the routing |
 | 03 (availability) | Easy | Prepend Linux return before the platform check |
 | 04 (skip download) | Medium | Function structure changed between versions (new feature flag); regex must be loose enough |
 | 05 (VM start) | Hard | 100+ line replacement including bubblewrap session setup; regex can't insert new code blocks easily |
@@ -201,17 +219,16 @@ The auto-update CI could then:
 
 ## Appendix: Identifier History
 
-| Purpose | v2685 | v2998 | v3189 |
-|---------|-------|-------|-------|
-| Platform flag | `Hi` | `Li` | `Ci` |
-| Availability check | `N7()` | `vz()` | `fz()` |
-| Download guard | `Qke()` | `gTe()` | `zTe()` |
-| VM start function | `D0t()` | `i0t()` | `v_t()` |
-| VM getter | `Ii()` | `_i()` | `Ei()` |
-| Platform getter | `B1e()` | `Oxe()` | `aAe()` |
-| Internal getter | `F1e()` | `Rxe()` | `iAe()` |
-| Resource path | `nSt()` | `hxt()` | `RAt()` |
-| Status dispatch | `lC(Ih.X)` | `g2(pf.X)` | `x2(wf.X)` |
-| electron module | `Pe` | `Te` | `Pe` |
+| Purpose | v2685 | v2998 | v3189 | 1.13576.0 |
+|---------|-------|-------|-------|-----------|
+| Platform flag | `Hi` | `Li` | `Ci` | — (removed upstream) |
+| Availability check | `N7()` | `vz()` | `fz()` | `Hce()` → `S3i()` (the `="darwin",process.arch` check) |
+| Download guard | `Qke()` | `gTe()` | `zTe()` | `PjA()` |
+| VM start function | `D0t()` | `i0t()` | `v_t()` | `N8i()` |
+| VM getter | `Ii()` | `_i()` | `Ei()` | `qo()` |
+| Platform getter | `B1e()` | `Oxe()` | `aAe()` | `Q_t()` |
+| Internal getter | `F1e()` | `Rxe()` | `iAe()` | `B_t()` (Swift loader) |
+| Status dispatch | `lC(Ih.X)` | `g2(pf.X)` | `x2(wf.X)` | `WuA()` (zero-arg notifier) |
+| electron module | `Pe` | `Te` | `Pe` | `cA` |
 | path module | `Te` | `Pe` | `Te` |
 | resources var | `_a` | `Sa` | `xa` |
