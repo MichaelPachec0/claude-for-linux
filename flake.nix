@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.13576.0";
-      claudeDmgHash = "sha256-1Vu29njSi5aEMXU1Bo7QtSEV8ZLBdDj27Y0rgSRV3D8=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-1290fc2ef5fd27a3883b74505e0ff917413d6832.dmg";
+      claudeVersion = "1.13576.4";
+      claudeDmgHash = "sha256-GNWWWGHJPrpv0NhzUdAFh7eeXSgyrv+ynQuRemHiJ0Q=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-414f858c8545ff8af38af267a1da714429ee98f9.dmg";
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
 
@@ -359,6 +359,31 @@
               grep -qF '__claudeCcdWrapped' "$INDEX" \
                 || { echo "ERROR: patch 16 (loader shim append) failed to apply"; exit 1; }
               echo "[patch:16] Done"
+
+              # --- Patch 17: eIPC origin validation for bundled renderer windows (regex) ---
+              # The auxiliary windows (find-in-page, about, quick, buddy) load their HTML from
+              # the bundle via loadFile(join(app.getAppPath(),".vite/renderer/<name>/...")), then
+              # their preloads call shared eIPC interfaces — DesktopIntl.getInitialLocale et al.
+              # Each interface guards its handler with an origin validator (gHe/ne/vr/g0/... — 8
+              # functions sharing one body) that allows file: frames ONLY when app.isPackaged===true.
+              # On Linux this fails two ways at once:
+              #   1. We launch as `electron <app.asar>`, so app.isPackaged is FALSE — the file:
+              #      branch (`protocol==="file:"&&isPackaged===!0`) never matches.
+              #   2. The frame URL comes through as a malformed `file://app:///.vite/renderer/...`
+              #      (empty port) on which `new URL()` THROWS, so the validator returns false at
+              #      its `try{e=new URL(...)}catch{return!1}` step before any origin check runs.
+              # Result: 'Incoming "getInitialLocale" call on interface "DesktopIntl" ... did not
+              # pass origin validation'. Inject a Linux short-circuit at the TOP of every URL-
+              # parsing validator (before `new URL`, so it survives the throw): accept a top-level
+              # (parent===null) file: frame whose path is under the bundle's `/.vite/renderer/`.
+              # That dir lives in the read-only Nix store, so no attacker can plant HTML there —
+              # this only re-grants first-party bundled renderers the access macOS gets for free
+              # via isPackaged, and leaves the claude.ai (https:) allowlist path untouched.
+              echo "[patch:17] Patching eIPC origin validation for renderer windows..."
+              perl -i -pe 's{(function (\w+)\((\w+)\)\{var \w+;if\(!\3\.senderFrame\|\|!\3\.senderFrame\.url\)return!1;)}{$1if(process.platform==="linux"\&\&$3.senderFrame.parent===null\&\&$3.senderFrame.url.startsWith("file:")\&\&$3.senderFrame.url.includes("/.vite/renderer/"))return!0;}g' "$INDEX"
+              grep -qP 'if\(process\.platform==="linux"&&\w+\.senderFrame\.parent===null&&\w+\.senderFrame\.url\.startsWith\("file:"\)&&\w+\.senderFrame\.url\.includes\("/\.vite/renderer/"\)\)return!0;' "$INDEX" \
+                || { echo "ERROR: patch 17 (eIPC origin validation) failed to apply"; exit 1; }
+              echo "[patch:17] Done"
 
               # --- Patch 09: DBus tray cleanup delay — REMOVED ---
               # This patch inserted `await new Promise(r=>setTimeout(r,250))` after every
