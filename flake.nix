@@ -292,6 +292,27 @@
                 || { echo "ERROR: patch 12 (tray in-place update) failed to apply"; exit 1; }
               echo "[patch:12] Done"
 
+              # --- Patch 18: Tray native context menu on Linux (regex) ---
+              # Upstream regression in 1.13576.0: the tray builder USED to branch on a flag
+              #   cn ? GE.on("right-click", ()=>...popUpContextMenu(pG)...) : GE.setContextMenu(pG)
+              # and on Linux took the setContextMenu(pG) path — handing a com.canonical.dbusmenu
+              # tree to the panel (COSMIC/Hyprland/etc.), which lays the menu out natively. In
+              # 1.13576.0 Anthropic DELETED the setContextMenu branch; the builder now ALWAYS wires
+              #   QQ.on("right-click", ()=>...QQ.popUpContextMenu(FcA)...)
+              # i.e. Electron draws its own GTK popup. On Wayland a tray popup has no parent surface
+              # to anchor to, so the compositor collapses it — the menu renders "squished". (Not an
+              # Electron-version issue: 1.12603.1 rendered fine under the same Electron; the menu
+              # mechanism is what changed.) Restore the native path on Linux: after the menu is built
+              # (`FcA=EXe()`), call setContextMenu(FcA), and gate the popUpContextMenu right-click
+              # handler to non-Linux — exactly the old `cn` ternary. Anchored on the click handler
+              # (`X.on("click",()=>void Y())`) immediately followed by the same tray var's
+              # right-click handler, which is unique to the tray builder.
+              echo "[patch:18] Patching tray native context menu (Linux)..."
+              perl -i -pe 's{(\w+)=(\w+)\(\),((\w+)\.on\("click",\(\)=>void \w+\(\)\)),(\4\.on\("right-click")}{$1=$2(),process.platform==="linux"&&$4.setContextMenu($1),$3,process.platform!=="linux"&&$5}g' "$INDEX"
+              grep -qP 'process\.platform==="linux"&&\w+\.setContextMenu\(\w+\),\w+\.on\("click"' "$INDEX" \
+                || { echo "ERROR: patch 18 (tray native context menu) failed to apply"; exit 1; }
+              echo "[patch:18] Done"
+
               # --- Patch 13: macOS-only systemPreferences.setUserDefault guard (regex) ---
               # Top-level app init unconditionally calls
               # `systemPreferences.setUserDefault("NSAutoFillHeuristicsEnabled","boolean",!1)`.

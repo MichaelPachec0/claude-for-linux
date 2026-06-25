@@ -62,6 +62,7 @@ See `docs/patching-architecture.md` for the full technical analysis.
 | 15 | `perl -pe` regex | Optional-call macOS-only BrowserWindow methods `setWindowButtonPosition` / `setHiddenInMissionControl` (were crashing on window setup) |
 | 16 | Append IIFE | Run the downloaded Claude Code (CCD) binary via the Nix glibc loader (its `/lib64/ld-linux` is a NixOS stub) + fall back to `$HOME` when a spawn cwd doesn't exist (stale macOS project paths) |
 | 17 | `perl -pe` regex | Pass eIPC origin validation for bundled renderer windows (find-in-page/about/quick/buddy): the validators only allow `file:` frames when `app.isPackaged` (false under `electron <asar>`), and the Linux frame URL `file://app:///…` throws in `new URL()`. Short-circuit all 8 URL-parsing validators **before** the parse for top-level `file:` frames under `/.vite/renderer/` (read-only store path) |
+| 18 | `perl -pe` regex | Restore native tray context menu on Linux. 1.13576.0 dropped the upstream `cn ? popUpContextMenu : setContextMenu` branch and now always Electron-draws the popup, which renders squished on Wayland (a tray popup has no parent surface to anchor). Re-inject `setContextMenu` (native dbusmenu, panel-rendered) on Linux and gate the `popUpContextMenu` right-click handler to non-Linux |
 
 ## Electron Gotchas
 
