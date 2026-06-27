@@ -23,6 +23,16 @@ nix run github:heytcass/claude-for-linux#claude-desktop-fhs
 nix profile install github:heytcass/claude-for-linux
 ```
 
+Launching from a terminal returns immediately — the app detaches into its own
+session (like a `.desktop` launch) instead of holding the shell open until you
+quit. Console output is logged to `$XDG_STATE_HOME/claude-desktop/claude-desktop.log`
+(defaults to `~/.local/state/claude-desktop/claude-desktop.log`). To keep the app
+attached to the terminal for live debugging, set `CLAUDE_DESKTOP_FOREGROUND=1`:
+
+```bash
+CLAUDE_DESKTOP_FOREGROUND=1 nix run github:heytcass/claude-for-linux
+```
+
 ### NixOS Module
 
 ```nix

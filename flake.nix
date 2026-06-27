@@ -478,9 +478,14 @@
             '';
           };
 
-          # Basic Claude Desktop wrapper (direct electron)
-          claudeDesktop = pkgs.symlinkJoin {
-            name = "claude-desktop-${claudeVersion}";
+          # Foreground Electron wrapper (direct electron). This holds the
+          # controlling terminal until the app exits — correct for running
+          # *inside* a sandbox/init (the FHS runScript) but not what you want
+          # when launching from a shell. The user-facing packages wrap this in
+          # a detaching launcher (mkDetachingLauncher) so `nix run` / a terminal
+          # invocation returns immediately instead of being swallowed.
+          claudeDesktopForeground = pkgs.symlinkJoin {
+            name = "claude-desktop-foreground-${claudeVersion}";
             paths = [ claudeApp ];
             nativeBuildInputs = [ pkgs.makeWrapper ];
             postBuild = ''
@@ -497,7 +502,35 @@
                 --set COWORK_SANDBOX_GLIBC "${pkgs.glibc}/lib" \
                 --set CHROME_DESKTOP "claude-desktop.desktop" \
                 --prefix XDG_DATA_DIRS : "$out/share"
+            '';
+          };
 
+          # Wrap a foreground launcher so that starting it from a shell (e.g.
+          # `nix run`) returns immediately and the GUI keeps running detached —
+          # the way a .desktop launch behaves — instead of the Electron process
+          # holding the terminal until you quit the app.
+          #
+          # setsid --fork puts the app in a brand-new session (no controlling
+          # tty, so it survives the terminal closing) and exits the parent right
+          # away, freeing the shell. stdout/stderr go to a log file so the
+          # maintainer can still read the app's console output; set
+          # CLAUDE_DESKTOP_FOREGROUND=1 to keep the app attached to the terminal
+          # (handy for live-watching logs while debugging patches).
+          mkDetachingLauncher = innerBin: pkgs.writeShellScriptBin "claude-desktop" ''
+            if [ -n "''${CLAUDE_DESKTOP_FOREGROUND:-}" ]; then
+              exec "${innerBin}" "$@"
+            fi
+            logdir="''${XDG_STATE_HOME:-$HOME/.local/state}/claude-desktop"
+            mkdir -p "$logdir" 2>/dev/null || logdir="''${TMPDIR:-/tmp}"
+            exec ${pkgs.util-linux}/bin/setsid --fork "${innerBin}" "$@" \
+              >>"$logdir/claude-desktop.log" 2>&1 </dev/null
+          '';
+
+          # Basic Claude Desktop package: detaching launcher + desktop entry + icons.
+          claudeDesktop = pkgs.symlinkJoin {
+            name = "claude-desktop-${claudeVersion}";
+            paths = [ (mkDetachingLauncher "${claudeDesktopForeground}/bin/claude-desktop") claudeApp ];
+            postBuild = ''
               # Desktop entry
               mkdir -p $out/share/applications
               cat > $out/share/applications/claude-desktop.desktop <<DESKTOP
@@ -521,9 +554,17 @@
             };
           };
 
-          # FHS wrapper for maximum compatibility (cowork + MCP)
-          claudeDesktopFHS = pkgs.buildFHSEnv {
+          # FHS sandbox running the foreground wrapper. dieWithParent is disabled
+          # because the user-facing claudeDesktopFHS detaches this via
+          # setsid --fork: bwrap's parent (setsid) exits immediately, and the
+          # default --die-with-parent would then SIGKILL the whole sandbox the
+          # instant the launcher returns. With it off (and no PID namespace),
+          # bwrap simply reparents to init and keeps running. runScript points at
+          # the *foreground* binary so Electron stays in the foreground of bwrap's
+          # own detached session, keeping the sandbox alive until the app quits.
+          claudeDesktopFHSInner = pkgs.buildFHSEnv {
             name = "claude-desktop";
+            dieWithParent = false;
             targetPkgs = pkgs: with pkgs; [
               bubblewrap
               nodejs
@@ -542,7 +583,20 @@
               curl
               wget
             ];
-            runScript = "${claudeDesktop}/bin/claude-desktop";
+            runScript = "${claudeDesktopForeground}/bin/claude-desktop";
+            meta = with pkgs.lib; {
+              description = "Claude Desktop for Linux (FHS) with Cowork and MCP support";
+              homepage = "https://claude.ai";
+              platforms = platforms.linux;
+              mainProgram = "claude-desktop";
+            };
+          };
+
+          # FHS wrapper for maximum compatibility (cowork + MCP), detached so it
+          # doesn't swallow the launching terminal.
+          claudeDesktopFHS = pkgs.symlinkJoin {
+            name = "claude-desktop-fhs-${claudeVersion}";
+            paths = [ (mkDetachingLauncher "${claudeDesktopFHSInner}/bin/claude-desktop") ];
             meta = with pkgs.lib; {
               description = "Claude Desktop for Linux (FHS) with Cowork and MCP support";
               homepage = "https://claude.ai";
