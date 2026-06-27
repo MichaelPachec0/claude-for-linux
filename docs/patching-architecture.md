@@ -4,16 +4,28 @@ This document describes the patching approach in `claude-for-linux`, compares it
 
 ## Current State
 
-**Option B (hybrid approach) has been implemented:**
+**Option B (hybrid approach) is implemented**, and the chain has since grown from the
+original Cowork patches to also cover Linux-specific crashes, Claude Code, and the tray
+as upstream evolved. All patches are applied inline in the Nix `buildPhase`:
 
-- 5 simple patches (02, 03, 04, 06, 08) converted to `perl -pe` regex with `\w+` wildcards
-- VM start (patch 05) uses dynamic Node.js discovery via `scripts/patch-vm-start.js`
-- Each regex patch verified with `grep -qP` post-check
-- Old `scripts/patches-XXXX/` directories removed
-- Standalone IIFEs extracted to `scripts/cowork-init.js` and `scripts/branding-fix.js`
+- **Regex patches** (`perl -pe` with `\w+` identifier wildcards): 03, 04, 06a/06b, 08a/08b,
+  10, 11, 12, 13, 14, 15a/15b, 17, 18
+- **Dynamic Node.js patch**: VM start (05) via `scripts/patch-vm-start.js` — the injection
+  is ~100 lines, too large for a single regex, so it discovers the function boundary from
+  the `[VM:start]` log string and injects the bubblewrap block
+- **Append-IIFE patches**: 01 (`scripts/cowork-init.js`), 07 (`scripts/branding-fix.js`),
+  16 (`scripts/ccd-ld-wrap.js`)
+- **File-copy patch**: 00 (`modules/enhanced-claude-native-stub.js` → `@ant/claude-native`)
+- Every regex patch is verified with a `grep -qP` post-check (and `node --check` for the
+  appended IIFEs). A failed verify **aborts the build**, so a stale regex can't ship silently
+- Patch 02 (win32 VM-client platform flag) removed in 1.13576.0 — dropped upstream; the
+  routing it did is now covered by patch 03 + 06a
 - Patch 09 (DBus tray cleanup delay) removed in 1.11847.5: its `await new Promise(...)`
   injection landed in now-synchronous functions (tray `HAe`, VM pipes `yMi`/`SMi`),
   a hard SyntaxError at startup. Reintroduce only as an async-aware node-script patch.
+
+The per-version `scripts/patches-XXXX/` directories (2321, 2512, 2685) remain only as
+historical reference for the old exact-match approach below; the build no longer uses them.
 
 ## The Problem
 
@@ -146,12 +158,30 @@ grep -oP '\w+\.setHiddenInMissionControl\(' $INDEX                         # pat
 # General sweep for the next one that breaks — list every macOS-only method call and
 # eyeball which lack a `process.platform==="darwin"` / `m6()` guard or a `?.` optional-call:
 grep -oP '\.(setActivationPolicy|setSecureKeyboardEntryEnabled|setWindowButtonVisibility|getUserDefault|setUserActivity|setVibrancy|setRepresentedFilename|moveToApplicationsFolder)\(' $INDEX
+
+# Patch 16: Claude Code (CCD) loader shim — append-only, no identifier discovery. The
+# build substitutes the `__CLAUDE_LDSO__` sentinel in scripts/ccd-ld-wrap.js with the Nix
+# glibc ld.so path and appends the IIFE; verify is `grep -qF "$glibcLdso"` + absence of the sentinel.
+
+# Patch 17: eIPC origin validator — the per-window guard that bails when there is no
+# senderFrame. Several validators share this exact preamble; the patch short-circuits each
+# for top-level file: frames under /.vite/renderer/ before the throwing `new URL()` parse.
+grep -oP 'function \w+\(\w+\)\{var \w+;if\(!\w+\.senderFrame\|\|!\w+\.senderFrame\.url\)return!1;' $INDEX
+
+# Patch 18: tray context menu — the tray builder's click handler immediately followed by
+# the SAME tray var's right-click handler (unique to the builder). We inject setContextMenu
+# on Linux and gate the popUpContextMenu right-click handler to non-Linux.
+grep -oP '\w+=\w+\(\),\w+\.on\("click",\(\)=>void \w+\(\)\),\w+\.on\("right-click"' $INDEX
 ```
 
 Patches 00-12 have been stable across v2685, v2998, v3189; the 1.13576.0 refactor dropped
 patch 02 and reworked 03/08b/12 (see the patch-difficulty table above). Patches 13-15 were
 added for 1.13576.0's new macOS-native call sites (Touch ID WebAuthn, traffic-light
-positioning, Mission Control hiding) that crash at startup/window-setup on Linux.
+positioning, Mission Control hiding) that crash at startup/window-setup on Linux. Patches
+16-17 followed for Claude Code's downloaded native binary (NixOS `ld-linux` stub) and the
+bundled renderer windows' eIPC origin validation. Patch 18 (1.15200.0-era) restores the
+native dbusmenu tray menu after 1.13576.0 dropped the upstream `setContextMenu` branch and
+began Electron-drawing a Wayland-unanchorable popup.
 
 ## Toward Automated Patching
 
