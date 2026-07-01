@@ -176,16 +176,25 @@
               # instance from the getter before the Swift module is ever touched). Dropped.
 
               # --- Patch 03: Availability check (regex) ---
-              # The Cowork capability check (S3i, reached via Hce()/X_().yukonSilver) hardcodes
-              # `const A="darwin",e=process.arch` then probes the macOS version and
-              # `require("@ant/claude-swift").vm.isVirtualizationSupported()` — all of which
-              # fail (or throw) on Linux. Short-circuit it: when global.__linuxCowork is live,
-              # return {status:"supported"} before any darwin/Swift logic runs. Hce() then flows
-              # through the platform-agnostic enterprise gating to Vj({status:"supported"}),
-              # so both the sync (X_()) and async (o0A()) availability paths report supported.
+              # The Cowork capability check (reached via the yukonSilver capability getter) returns
+              # {status:"supported"|"unsupported"} for the current platform. Newer builds added
+              # first-class Windows Cowork support, so it NO LONGER hardcodes the old
+              # `const A="darwin",e=process.arch` pair (patch 02/03's historic anchor). It now reads
+              # the platform into a var and branches per-OS:
+              #   function v7i(){const A=process.platform;
+              #     if(A!=="darwin"&&A!=="win32")return{status:"unsupported",...unsupported_platform};
+              #     const e=process.arch; if(e!=="x64"&&e!=="arm64")return{...unsupported_architecture};
+              #     ...then probes OS version + (darwin) @ant/claude-swift.vm.isVirtualizationSupported()
+              #        / (win32) HCS — all of which reject or throw on Linux.
+              # Linux is rejected by the very FIRST guard (unsupported_platform). Short-circuit it:
+              # inject a Linux early-return at the top of the function, before `const A=process.platform`,
+              # so when global.__linuxCowork is live it reports {status:"supported"} before any
+              # darwin/win32/Swift/HCS logic runs. Anchored on the unique first-guard signature
+              # (`const \w+=process.platform;if(\w+!=="darwin"&&\w+!=="win32")return{status:"unsupported"`).
+              # Both the sync and async availability paths flow through this one function.
               echo "[patch:03] Patching availability check..."
-              perl -i -pe 's{(function \w+\(\)\{var \w+;const \w+="darwin",\w+=process\.arch;)}{$1if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};}g' "$INDEX"
-              grep -qP 'const \w+="darwin",\w+=process\.arch;if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\}' "$INDEX" \
+              perl -i -pe 's{(function \w+\(\)\{)(const \w+=process\.platform;if\(\w+!=="darwin"&&\w+!=="win32"\)return\{status:"unsupported")}{$1if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};$2}g' "$INDEX"
+              grep -qP 'function \w+\(\)\{if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\};const \w+=process\.platform;if\(\w+!=="darwin"&&\w+!=="win32"\)' "$INDEX" \
                 || { echo "ERROR: patch 03 (availability check) failed to apply"; exit 1; }
               echo "[patch:03] Done"
 
@@ -273,24 +282,24 @@
                 || { echo "ERROR: patch 11 (shell-env worker path) failed to apply"; exit 1; }
               echo "[patch:11] Done"
 
-              # --- Patch 12: Tray in-place update (regex) ---
-              # The single tray builder destroys and recreates the Tray on every call, and it's
-              # invoked several times during startup (helper-app-launched + nativeTheme "updated"
-              # + menuBarEnabled). Each new Tray re-exports the StatusNotifierItem / dbusmenu
-              # D-Bus objects before the destroyed one finishes deregistering, spamming
-              # "org.kde.StatusNotifierItem.* is already exported". On Linux, if a tray already
-              # exists and is still wanted, update its image in place and return instead of
-              # destroy+recreate (click handler and menu persist from first creation). This is
-              # the race the removed patch 09 targeted, fixed without an (illegal) await.
-              # The builder now computes the image path first (`const t=join(dir(),e)`), then
-              # runs `if(OQ&&(OQ.destroy(),OQ=null),!A){...return}OQ=new Tray(...createFromPath(t))`.
-              # Inject the Linux in-place update before that destroy/recreate, while the old
-              # tray (OQ) is still live: if it exists and is still wanted (A), setImage and return.
-              echo "[patch:12] Patching tray in-place update..."
-              perl -i -pe 's{(const (\w+)=\w+\.join\([\w\$]+\(\),\w+\);)(if\((\w+)&&\(\4\.destroy\(\),\4=null\),!(\w+)\)\{[\w\$]+\(\);return\}\4=new (\w+)\.Tray\(\6\.nativeImage\.createFromPath\(\2\)\))}{$1if(process.platform==="linux"&&$4&&$5){$4.setImage($6.nativeImage.createFromPath($2));return}$3}g' "$INDEX"
-              grep -qP 'process\.platform==="linux"&&\w+&&\w+\)\{\w+\.setImage\(\w+\.nativeImage\.createFromPath\(\w+\)\);return\}' "$INDEX" \
-                || { echo "ERROR: patch 12 (tray in-place update) failed to apply"; exit 1; }
-              echo "[patch:12] Done"
+              # --- Patch 12: Tray in-place update — REMOVED ---
+              # This patch stopped the tray builder from destroy+recreating the Tray on every call
+              # (helper-app-launched + nativeTheme "updated" + menuBarEnabled all invoke it during
+              # startup). Each recreate re-exported the StatusNotifierItem / dbusmenu D-Bus objects
+              # before the old one finished deregistering, spamming "org.kde.StatusNotifierItem.* is
+              # already exported". It injected a Linux "if the tray exists and is still wanted,
+              # setImage and return" branch before the destroy/recreate.
+              # As of 1.17377.1 upstream implements this natively — and better. The builder now
+              # caches the Tray instance (was `let HE=null`) and its last image path (`OuA`), and its
+              # body runs:
+              #   if(!A){HE&&!HE.isDestroyed()&&HE.destroy(),HE=null,OuA=null,...;return}          // not wanted
+              #   if(HE&&!HE.isDestroyed()){t!==OuA&&(HE.setImage(..createFromPath(t)),OuA=t);return} // in place
+              #   HE=new cA.Tray(..createFromPath(t)),OuA=t,...HE.on("click"..)                    // first create only
+              # An existing, still-wanted tray takes the in-place setImage branch — guarded by
+              # t!==OuA, so it only re-images when the theme/icon actually changed — and returns; it
+              # never destroy+recreates. The old anchor (`...HE=null),!A){..}HE=new ..Tray`) no longer
+              # exists and the patch has nothing left to add. Dropped. (Patch 18 still restores the
+              # native context menu on the surviving `HE.on("click")/HE.on("right-click")` wiring.)
 
               # --- Patch 18: Tray native context menu on Linux (regex) ---
               # Upstream regression in 1.13576.0: the tray builder USED to branch on a flag
