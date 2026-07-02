@@ -47,7 +47,7 @@ See `docs/patching-architecture.md` for the full technical analysis.
 | 00 | File copy | Electron API stubs for Linux (`@ant/claude-native`) |
 | 01 | Append IIFE | Load bubblewrap Cowork module |
 | 02 | — | **Removed** — win32 VM-client path dropped upstream (1.13576.0); job now covered by 03 + 06a; see `flake.nix` |
-| 03 | `perl -pe` regex | Return "supported" for Linux availability (anchored on the `="darwin",process.arch` capability check) |
+| 03 | `perl -pe` regex | Return "supported" for Linux availability (anchored on the capability check's first guard `const X=process.platform;if(X!=="darwin"&&X!=="win32")return{status:"unsupported"…}` — the old `="darwin",process.arch` form was dropped when upstream added Windows Cowork; see `flake.nix`) |
 | 04 | `perl -pe` regex | Skip macOS VM bundle download |
 | 05 | Node.js dynamic | Create bubblewrap session at VM start |
 | 06 | `perl -pe` regex | Return Linux VM instance from getters |
@@ -56,7 +56,7 @@ See `docs/patching-architecture.md` for the full technical analysis.
 | 09 | — | **Removed** — injected `await` into now-synchronous fns (crash); see `flake.nix` |
 | 10 | `perl -pe` regex | Add Linux targets to Claude Code `getHostPlatform()` (was throwing) |
 | 11 | `perl -pe` regex | Resolve shell-env worker via `__dirname` (was using `process.resourcesPath`) |
-| 12 | `perl -pe` regex | Update tray image in place on Linux (stop StatusNotifierItem re-export spam) |
+| 12 | — | **Removed** — upstream (1.17377.1) now caches the Tray instance + last image path and updates in place natively, so the destroy+recreate spam this fixed can't recur; see `flake.nix` |
 | 13 | `perl -pe` regex | Gate macOS-only `systemPreferences.setUserDefault` behind a darwin check (was crashing at startup) |
 | 14 | `perl -pe` regex | Gate macOS-only `app.configureWebAuthn` (Touch ID WebAuthn) behind a darwin check (was crashing at startup) |
 | 15 | `perl -pe` regex | Optional-call macOS-only BrowserWindow methods `setWindowButtonPosition` / `setHiddenInMissionControl` (were crashing on window setup) |

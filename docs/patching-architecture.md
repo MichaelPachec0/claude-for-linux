@@ -9,7 +9,7 @@ original Cowork patches to also cover Linux-specific crashes, Claude Code, and t
 as upstream evolved. All patches are applied inline in the Nix `buildPhase`:
 
 - **Regex patches** (`perl -pe` with `\w+` identifier wildcards): 03, 04, 06a/06b, 08a/08b,
-  10, 11, 12, 13, 14, 15a/15b, 17, 18
+  10, 11, 13, 14, 15a/15b, 17, 18
 - **Dynamic Node.js patch**: VM start (05) via `scripts/patch-vm-start.js` — the injection
   is ~100 lines, too large for a single regex, so it discovers the function boundary from
   the `[VM:start]` log string and injects the bubblewrap block
@@ -23,6 +23,10 @@ as upstream evolved. All patches are applied inline in the Nix `buildPhase`:
 - Patch 09 (DBus tray cleanup delay) removed in 1.11847.5: its `await new Promise(...)`
   injection landed in now-synchronous functions (tray `HAe`, VM pipes `yMi`/`SMi`),
   a hard SyntaxError at startup. Reintroduce only as an async-aware node-script patch.
+- Patch 12 (tray in-place update) removed in 1.17377.1: upstream now caches the Tray
+  instance and its last image path and updates the icon in place itself — guarded by a
+  path-changed check — so the destroy+recreate StatusNotifierItem re-export spam it prevented
+  can no longer occur. Its anchor (`…HE=null),!A){…}HE=new …Tray`) no longer exists.
 
 The per-version `scripts/patches-XXXX/` directories (2321, 2512, 2685) remain only as
 historical reference for the old exact-match approach below; the build no longer uses them.
@@ -116,12 +120,15 @@ Even when doing manual updates, the key insight is that **each function has a st
 INDEX=/path/to/extracted/.vite/build/index.js
 
 # Patch 02: REMOVED in 1.13576.0 — the darwin/win32 platform-flag pair (the Windows
-# VM client) no longer exists; the capability check below hardcodes "darwin" instead.
+# VM client) no longer exists; the capability check below reads process.platform and
+# branches per-OS (darwin/win32) instead.
 
 # Patch 03: Availability check — the platform/arch capability check (reached via the
-# yukonSilver feature getter). It hardcodes `const X="darwin",Y=process.arch` then probes
-# the macOS version + @ant/claude-swift; we short-circuit it with a Linux supported return.
-grep -oP 'function \w+\(\)\{var \w+;const \w+="darwin",\w+=process\.arch;' $INDEX
+# yukonSilver capability getter). Since Windows Cowork was added it no longer hardcodes
+# `const X="darwin",Y=process.arch`; it reads the platform into a var and rejects anything
+# but darwin/win32 in its FIRST guard, then probes OS version + @ant/claude-swift (darwin) /
+# HCS (win32). We short-circuit it with a Linux supported return before that first guard.
+grep -oP 'function \w+\(\)\{const \w+=process\.platform;if\(\w+!=="darwin"&&\w+!=="win32"\)return\{status:"unsupported"' $INDEX
 
 # Patch 04: Download guard — the async function near [downloadVM] log messages
 # (params are minified, e.g. (A,e); the verify regex uses \(\w+,\w+\), not literal (t,e))
