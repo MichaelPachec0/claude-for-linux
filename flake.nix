@@ -142,7 +142,26 @@
               # Apply patches (version-resilient regex + dynamic discovery)
               echo "[5/6] Applying patches..."
 
-              INDEX="extracted/.vite/build/index.js"
+              # v1.22209.3 code-splits the main process: .vite/build/index.js is now a tiny
+              # loader stub that require()s the real main-process bundle, index.chunk-<hash>.js
+              # (the hash changes every build). ALL regex/append patches below target that
+              # bundle's code — the availability check, tray builder, getHostPlatform, eIPC
+              # validators, etc. all moved out of the stub into the chunk. Resolve the chunk
+              # from the stub's require() so patches hit real code, not the 792-byte stub.
+              # Fall back to index.js itself for older, monolithic builds so the flake keeps
+              # working across the split boundary. Appends (cowork loader, CCD shim) also go
+              # into the chunk, exactly reproducing the pre-split layout where index.js held
+              # both the main code and the appended bootstrap — the stub require()s the chunk
+              # unconditionally at startup, so appended code still runs.
+              STUB="extracted/.vite/build/index.js"
+              MAINCHUNK="$(grep -oP 'require\("\./\Kindex\.chunk-\w+\.js(?="\))' "$STUB" | head -1)"
+              if [ -n "$MAINCHUNK" ] && [ -f "extracted/.vite/build/$MAINCHUNK" ]; then
+                INDEX="extracted/.vite/build/$MAINCHUNK"
+                echo "  Main-process bundle: $MAINCHUNK (code-split; patching the stub's required chunk)"
+              else
+                INDEX="extracted/.vite/build/index.js"
+                echo "  Main-process bundle: index.js (monolithic)"
+              fi
               MAINVIEW="extracted/.vite/build/mainView.js"
 
               # --- Patch 00: Native module stub ---
@@ -207,9 +226,11 @@
               echo "[patch:04] Done"
 
               # --- Patch 05: VM start intercept (dynamic Node.js) ---
-              # Discovers function name via [VM:start] log string, injects bubblewrap session
+              # Discovers function name via [VM:start] log string, injects bubblewrap session.
+              # Pass $INDEX (the resolved main-process bundle) so it patches the code-split
+              # chunk rather than the loader stub.
               echo "[patch:05] Patching VM start intercept..."
-              ${pkgs.nodejs}/bin/node ${./scripts/patch-vm-start.js} extracted
+              ${pkgs.nodejs}/bin/node ${./scripts/patch-vm-start.js} extracted "$INDEX"
               echo "[patch:05] Done"
 
               # --- Patch 06a: VM getter (regex) ---
