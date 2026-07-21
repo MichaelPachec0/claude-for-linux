@@ -12,7 +12,11 @@ const fs = require('fs');
 const path = require('path');
 
 const EXTRACTED_DIR = process.argv[2] || '/tmp/app-extracted';
-const INDEX_JS_PATH = path.join(EXTRACTED_DIR, '.vite/build/index.js');
+// argv[3], when provided by the flake, is the resolved main-process bundle path.
+// v1.22209.3 code-splits index.js into a loader stub + index.chunk-<hash>.js, and
+// the [VM:start] function lives in that chunk. Fall back to the monolithic index.js
+// for older, unsplit builds.
+const INDEX_JS_PATH = process.argv[3] || path.join(EXTRACTED_DIR, '.vite/build/index.js');
 
 console.log('=== Dynamic Patch: VM Start Intercept ===\n');
 
