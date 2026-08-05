@@ -45,11 +45,28 @@ jobs:
       # "build succeeds but the app crashes at startup with a SyntaxError" failure mode.
       - name: Verify patched JS parses (smoke test)
         run: |
+          set -o pipefail
           out=$(nix build .#claude-app --no-link --print-out-paths)
           dest="$RUNNER_TEMP/asar-extracted"
           nix develop --command python3 tools/asar_tool.py extract \
             "$out/lib/claude-desktop/app.asar" "$dest"
-          for f in index.js mainView.js; do
+
+          # Since 1.22209.3 the main process is code-split: .vite/build/index.js is a ~800-byte
+          # loader stub and ALL patched main-process code lives in the index.chunk-<hash>.js it
+          # require()s. Checking index.js alone therefore parsed the stub and never looked at a
+          # single patched byte. Resolve the chunk exactly like flake.nix does and check it too;
+          # fall back gracefully if upstream ever un-splits the bundle.
+          files=(index.js mainView.js)
+          chunk=$(grep -oP 'require\("\./\Kindex\.chunk-\w+\.js(?="\))' \
+            "$dest/.vite/build/index.js" | head -1) || true
+          if [ -n "$chunk" ] && [ -f "$dest/.vite/build/$chunk" ]; then
+            files+=("$chunk")
+            echo "Main-process bundle is code-split: $chunk"
+          else
+            echo "No code-split chunk found; treating index.js as the monolithic bundle"
+          fi
+
+          for f in "${files[@]}"; do
             nix develop --command node --check "$dest/.vite/build/$f"
             echo "$f: parses OK"
           done

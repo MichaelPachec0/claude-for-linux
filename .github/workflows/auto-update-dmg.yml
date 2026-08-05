@@ -199,8 +199,14 @@ jobs:
         id: build
         continue-on-error: true
         run: |
+          # `set -o pipefail` is load-bearing. GitHub's default shell is `bash -e {0}` —
+          # errexit WITHOUT pipefail — so `nix build ... | tee` exits with tee's status
+          # (always 0) no matter how the build went. That made steps.build.outcome
+          # 'success' for every broken build, and the "Build verified" comment below
+          # fired on top of a build log that ended in `error: ... failed to build`
+          # (seen on v1.24012.11, where patch 06b no longer applied).
+          set -o pipefail
           nix build . --print-build-logs 2>&1 | tee build-output.log
-          echo "build_ok=true" >> "$GITHUB_OUTPUT"
 
       - name: Comment on PR (build succeeded)
         if: steps.build.outcome == 'success'
@@ -224,26 +230,23 @@ jobs:
           OLD_VERSION: ${{ needs.check-update.outputs.current_version }}
           NEW_VERSION: ${{ needs.check-update.outputs.latest_version }}
         run: |
-          patch_build="${NEW_VERSION##*.}"
-
           # Build comment body safely — keeps build log out of heredoc interpolation
           cat > comment-body.md <<COMMENT
           @claude The automated version bump from v${OLD_VERSION} to v${NEW_VERSION} broke the build. The patches need updating for the new version's minified JavaScript.
 
           ## Context
 
-          - Patches in \`scripts/patches-2685/\` target minified JS patterns from v${OLD_VERSION}
-          - The new v${NEW_VERSION} has different minified variable names and function signatures
-          - See \`CLAUDE.md\` for the full patch chain documentation and patching workflow
+          - The patch chain lives inline in \`flake.nix\` as \`perl -i -pe\` regexes, each followed by a \`grep -qP ... || exit 1\` verification. The failing patch is named in the log below. (\`scripts/patches-*/\` are legacy and unused.)
+          - Anchors deliberately match minified identifiers with wildcards, so a version bump usually needs no change — a failure means the surrounding *code shape* moved, or the identifier fell outside the character class (note \`\w\` does NOT match \`\$\`, which minified names can contain).
+          - The main process is code-split: \`.vite/build/index.js\` is a loader stub and the real code is in the \`index.chunk-<hash>.js\` it require()s. \`flake.nix\` resolves this into \`\$INDEX\`; patch against that file.
+          - See \`CLAUDE.md\` for the full patch chain table and patching workflow.
 
           ## What to do
 
-          1. Copy \`scripts/patches-2685/\` to \`scripts/patches-${patch_build}/\` as a starting point
-          2. Run \`nix build .\` to see which patches fail
-          3. Use the dev shell (\`nix develop\`) to extract the new version's \`index.js\`
-          4. For each failing patch, find the equivalent pattern in the new JS and update the search/replace strings
-          5. Update the patch directory references in \`flake.nix\` (hardcoded as \`scripts/patches-2685/\`)
-          6. Verify \`nix build .\` succeeds
+          1. Run \`nix build .\` to see which patch's \`grep -qP\` verification fails
+          2. Extract the new version's app.asar (\`nix develop\`, then \`python3 tools/asar_tool.py extract <app.asar> <dest>\`)
+          3. Locate the failing patch's anchor in the resolved main-process chunk and adjust the regex in \`flake.nix\` — keep it as loose as possible so it survives the next bump
+          4. Verify \`nix build .\` succeeds
 
           <details>
           <summary>Build output (last 200 lines)</summary>
