@@ -242,9 +242,14 @@
               echo "[patch:06a] Done"
 
               # --- Patch 06b: Platform getter (regex) ---
-              # Don't return null for Linux in platform-gated getter
+              # Don't return null for Linux in platform-gated getter.
+              # NOTE: the minifier's identifier alphabet includes `$`, and in 1.24012.11 this
+              # getter is named `$at` (`async function $at(){return process.platform!=="darwin"
+              # ?null:await Eat()}`). Perl's `\w` is [A-Za-z0-9_] and does NOT match `$`, so the
+              # old `\w+` anchor silently missed. Match identifiers with `[\w\$]+` (same fix
+              # already applied to patch 08a).
               echo "[patch:06b] Patching platform getter..."
-              perl -i -pe 's{(async function \w+\(\)\{return )process\.platform!=="darwin"\?null(:await \w+\(\))}{''${1}process.platform!=="darwin"\&\&process.platform!=="linux"?null''${2}}g' "$INDEX"
+              perl -i -pe 's{(async function [\w\$]+\(\)\{return )process\.platform!=="darwin"\?null(:await [\w\$]+\(\))}{''${1}process.platform!=="darwin"\&\&process.platform!=="linux"?null''${2}}g' "$INDEX"
               grep -qP 'process\.platform!=="darwin"&&process\.platform!=="linux"\?null' "$INDEX" \
                 || { echo "ERROR: patch 06b (platform getter) failed to apply"; exit 1; }
               echo "[patch:06b] Done"
