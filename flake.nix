@@ -763,11 +763,11 @@
               nodejs
               python3
               bubblewrap
-              electron_37
+              electron_41
               _7zz
 
               # Development tools
-              nodePackages.prettier
+              prettier
             ];
 
             shellHook = ''
