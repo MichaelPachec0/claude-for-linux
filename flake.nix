@@ -142,27 +142,53 @@
               # Apply patches (version-resilient regex + dynamic discovery)
               echo "[5/6] Applying patches..."
 
-              # v1.22209.3 code-splits the main process: .vite/build/index.js is now a tiny
-              # loader stub that require()s the real main-process bundle, index.chunk-<hash>.js
-              # (the hash changes every build). ALL regex/append patches below target that
-              # bundle's code — the availability check, tray builder, getHostPlatform, eIPC
-              # validators, etc. all moved out of the stub into the chunk. Resolve the chunk
-              # from the stub's require() so patches hit real code, not the 792-byte stub.
-              # Fall back to index.js itself for older, monolithic builds so the flake keeps
-              # working across the split boundary. Appends (cowork loader, CCD shim) also go
-              # into the chunk, exactly reproducing the pre-split layout where index.js held
-              # both the main code and the appended bootstrap — the stub require()s the chunk
-              # unconditionally at startup, so appended code still runs.
-              STUB="extracted/.vite/build/index.js"
-              MAINCHUNK="$(grep -oP 'require\("\./\Kindex\.chunk-\w+\.js(?="\))' "$STUB" | head -1)"
-              if [ -n "$MAINCHUNK" ] && [ -f "extracted/.vite/build/$MAINCHUNK" ]; then
-                INDEX="extracted/.vite/build/$MAINCHUNK"
-                echo "  Main-process bundle: $MAINCHUNK (code-split; patching the stub's required chunk)"
-              else
-                INDEX="extracted/.vite/build/index.js"
-                echo "  Main-process bundle: index.js (monolithic)"
+              # --- Main-process file set -------------------------------------------------
+              # The main process is code-split, and HOW it is split changes without notice:
+              #   <= 1.22209.2  monolithic index.js
+              #   1.22209.3     index.js loader stub + ONE big index.chunk-<hash>.js
+              #   1.28929.0     entry moved to index.pre.js (package.json "main"), which
+              #                 require()s index.js, which require()s ~30 chunks out of 347
+              # The old "resolve the stub's first required chunk" heuristic broke on that last
+              # reshuffle: the first require() is now a 1.7 KB esm-interop helper, so every
+              # regex patch targeted a file containing none of their anchors and silently
+              # no-op'd. Chunk layout is a bundler artifact with no stability guarantee, so
+              # stop guessing which file holds what: run every regex patch across ALL emitted
+              # main-process JS and let the anchors decide. Each patch still hard-fails if its
+              # anchor matched nowhere, so a genuine upstream shape change is still caught.
+              BUILD="extracted/.vite/build"
+              CHUNKS=()
+              while IFS= read -r f; do CHUNKS+=("$f"); done < <(find "$BUILD" -maxdepth 1 -name '*.js' | sort)
+              if [ ''${#CHUNKS[@]} -eq 0 ]; then
+                echo "ERROR: no main-process JS found under $BUILD"
+                exit 1
               fi
-              MAINVIEW="extracted/.vite/build/mainView.js"
+              echo "  Main-process bundle: ''${#CHUNKS[@]} JS files under $BUILD (code-split)"
+
+              # Appends (cowork loader, CCD shim) go into the loader stub index.js: it is
+              # require()d by the index.pre.js entry and itself require()s every chunk, so
+              # appended code runs after the whole main process is defined — exactly the
+              # pre-split layout where index.js held both the main code and the bootstrap.
+              INDEX="$BUILD/index.js"
+              MAINVIEW="$BUILD/mainView.js"
+
+              # patch_js <name> <perl-expr> <verify-pcre>
+              # Applies the substitution across every main-process file, then requires the
+              # result to be observable somewhere. Both args must be single-quoted at the call
+              # site: they are expanded once, into perl/grep, never re-parsed by the shell.
+              #
+              # NOTE on quoting in the anchors below: as of 1.28929.0 the minifier emits
+              # BACKTICK string literals (`darwin`, not "darwin"), declares with `let` rather
+              # than `const`, and uses native optional chaining (`x?.vm`) instead of the old
+              # `x==null?void 0:x.vm` desugar. Anchors therefore accept either quote style via
+              # ["\x60] (\x60 = backtick, kept as an escape so the char is unambiguous inside
+              # nested nix/shell/perl quoting) and either declaration keyword. Injected code
+              # always uses plain double quotes — valid JS regardless of what the minifier does.
+              patch_js() {
+                local name="$1" expr="$2" verify="$3"
+                perl -i -pe "$expr" "''${CHUNKS[@]}"
+                grep -qP "$verify" "''${CHUNKS[@]}" \
+                  || { echo "ERROR: patch $name failed to apply"; exit 1; }
+              }
 
               # --- Patch 00: Native module stub ---
               echo "[patch:00] Installing native module stub..."
@@ -206,52 +232,116 @@
               #     ...then probes OS version + (darwin) @ant/claude-swift.vm.isVirtualizationSupported()
               #        / (win32) HCS — all of which reject or throw on Linux.
               # Linux is rejected by the very FIRST guard (unsupported_platform). Short-circuit it:
-              # inject a Linux early-return at the top of the function, before `const A=process.platform`,
+              # inject a Linux early-return at the top of the function, before `let A=process.platform`,
               # so when global.__linuxCowork is live it reports {status:"supported"} before any
               # darwin/win32/Swift/HCS logic runs. Anchored on the unique first-guard signature
-              # (`const \w+=process.platform;if(\w+!=="darwin"&&\w+!=="win32")return{status:"unsupported"`).
+              # (`let \w+=process.platform;if(\w+!==`darwin`&&\w+!==`win32`)return{status:`unsupported``).
               # Both the sync and async availability paths flow through this one function.
               echo "[patch:03] Patching availability check..."
-              perl -i -pe 's{(function \w+\(\)\{)(const \w+=process\.platform;if\(\w+!=="darwin"&&\w+!=="win32"\)return\{status:"unsupported")}{$1if(process.platform==="linux"\&\&global.__linuxCowork)return\{status:"supported"\};$2}g' "$INDEX"
-              grep -qP 'function \w+\(\)\{if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\};const \w+=process\.platform;if\(\w+!=="darwin"&&\w+!=="win32"\)' "$INDEX" \
-                || { echo "ERROR: patch 03 (availability check) failed to apply"; exit 1; }
+              patch_js 03 \
+                's{(function [\w\$]+\(\)\{)((?:const|let|var) [\w\$]+=process\.platform;if\([\w\$]+!==["\x60]darwin["\x60]&&[\w\$]+!==["\x60]win32["\x60]\)return\{status:["\x60]unsupported["\x60])}{$1if(process.platform==="linux"&&global.__linuxCowork)return{status:"supported"};$2}g' \
+                'function [\w$]+\(\)\{if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{status:"supported"\};(?:const|let|var) [\w$]+=process\.platform;'
               echo "[patch:03] Done"
 
               # --- Patch 04: Skip download (regex) ---
-              # Skips macOS VM bundle download on Linux
+              # Skips macOS VM bundle download on Linux. The downloader is the two-arg async
+              # function that opens by reading the yukonSilver capability off the capability
+              # map (`async function X(e,n){let{yukonSilver:r}=p.n();return r?.status===`supported`?...`)
+              # — a unique, stable signature. The old anchor was "any two-arg async function
+              # within 200 chars of a [downloadVM] log string", which also matched the unrelated
+              # stale-cache sweeper in the same chunk.
               echo "[patch:04] Patching download skip..."
-              perl -i -pe 's{(async function \w+\(\w+,\w+\)\{)(.{0,200}?\[downloadVM\])}{$1if(process.platform==="linux"\&\&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' "$INDEX"
-              grep -qP 'async function \w+\(\w+,\w+\)\{if\(process\.platform==="linux"' "$INDEX" \
-                || { echo "ERROR: patch 04 (skip download) failed to apply"; exit 1; }
+              patch_js 04 \
+                's{(async function [\w\$]+\([\w\$]+,[\w\$]+\)\{)(let\{yukonSilver:)}{$1if(process.platform==="linux"&&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' \
+                'if\(process\.platform==="linux"&&global\.__linuxCowork\)\{console\.log\("\[Cowork Linux\] Skipping bundle download"\)'
               echo "[patch:04] Done"
+
+              # --- Patch 19: Cowork setup state for the renderer (regex) ---
+              # Patch 04 makes the VM-bundle download a no-op on Linux, but the renderer does
+              # not ask "did the download run" — it asks the CoworkVM eIPC interface for the
+              # bundle's state on disk:
+              #   getDownloadStatus(){return j.d()?E.u.Downloading:j.u()?E.u.Ready:E.u.NotDownloaded}
+              #   async download(){try{return await j.r(),{success:j.u()}}catch...}
+              # `j.u()` is the bundle-file readiness probe (every macOS VM bundle file present
+              # and hash-matched under <userData>/…). On Linux nothing is ever downloaded, so it
+              # returns false forever: the Cowork tab shows the "Get set up for agent mode —
+              # download a one-time package" card, and pressing it reports {success:false} (patch
+              # 04 short-circuits the download), so the user is stuck in that card and never
+              # reaches VM start (patch 05) at all.
+              # Report Ready / success on Linux when the bubblewrap backend is live — there is no
+              # bundle to install; the "workspace" is created per session by patch 05.
+              echo "[patch:19a] Patching Cowork download status..."
+              patch_js 19a \
+                's{(getDownloadStatus\(\)\{)(return [\w\$]+\.[\w\$]+\(\)\?([\w\$]+\.[\w\$]+)\.Downloading:)}{$1if(process.platform==="linux"&&global.__linuxCowork)return $3.Ready;$2}g' \
+                'getDownloadStatus\(\)\{if\(process\.platform==="linux"&&global\.__linuxCowork\)return [\w$.]+\.Ready;'
+              echo "[patch:19a] Done"
+
+              echo "[patch:19b] Patching Cowork download result..."
+              patch_js 19b \
+                's{(async download\(\)\{)(try\{return await [\w\$]+\.[\w\$]+\(\),\{success:)}{$1if(process.platform==="linux"&&global.__linuxCowork)return{success:!0};$2}g' \
+                'async download\(\)\{if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{success:!0\};'
+              echo "[patch:19b] Done"
+
+              # --- Patch 20: macOS "disclaimer" helper wrapper (regex) ---
+              # Claude Code is never spawned directly: every launch is routed through a small
+              # macOS helper binary that lives in the app bundle at Contents/Helpers/disclaimer
+              # (it exists so macOS attributes TCC/privacy prompts to the helper rather than to
+              # Electron). The resolver and the wrapper are:
+              #   function a(){let e=path.dirname(process.resourcesPath);return path.join(e,`Helpers`,`disclaimer`)}
+              #   function o(e){return{cmd:a(),args:[e.cmd,...e.args]}}
+              # and the host-loop session builder feeds that straight to the SDK:
+              #   let De=s.i({cmd:x,args:[]});
+              #   e.pathToClaudeCodeExecutable=De.cmd; e.executableArgs=De.args;
+              # so the SDK is told the EXECUTABLE is the disclaimer helper and the real claude
+              # binary is merely argv[1]. On Linux there is no Contents/Helpers — the path lands
+              # inside the Electron store dir (<electron>/libexec/electron/Helpers/disclaimer) —
+              # so every Cowork session dies instantly with
+              #   "Claude Code native binary not found at .../Helpers/disclaimer"
+              #   (error_category: disclaimer_binary_missing)
+              # which the UI reports as "The Claude Code binary is missing or damaged."
+              # There is nothing for the helper to do on Linux (no TCC), so make the wrapper a
+              # pass-through there: the SDK gets the real binary as the executable and an empty
+              # argv, exactly as if the helper had exec'd it. Patching the wrapper rather than the
+              # resolver covers all of its callers (host loop, usage probe, dev-server detect,
+              # spawnAsync) in one place, and leaves the macOS path byte-identical.
+              echo "[patch:20] Patching macOS disclaimer helper wrapper..."
+              patch_js 20 \
+                's{function ([\w\$]+)\(([\w\$]+)\)\{return\{cmd:([\w\$]+)\(\),args:\[\2\.cmd,\.\.\.\2\.args\]\}\}}{function $1($2){return process.platform==="linux"?{cmd:$2.cmd,args:$2.args}:{cmd:$3(),args:[$2.cmd,...$2.args]}}}g' \
+                'return process\.platform==="linux"\?\{cmd:[\w$]+\.cmd,args:[\w$]+\.args\}:\{cmd:[\w$]+\(\),args:\['
+              echo "[patch:20] Done"
 
               # --- Patch 05: VM start intercept (dynamic Node.js) ---
               # Discovers function name via [VM:start] log string, injects bubblewrap session.
-              # Pass $INDEX (the resolved main-process bundle) so it patches the code-split
-              # chunk rather than the loader stub.
+              # The script locates the owning chunk itself (the [VM:start] function has moved
+              # between chunks across releases), so it only needs the extracted app root.
               echo "[patch:05] Patching VM start intercept..."
-              ${pkgs.nodejs}/bin/node ${./scripts/patch-vm-start.js} extracted "$INDEX"
+              ${pkgs.nodejs}/bin/node ${./scripts/patch-vm-start.js} extracted
               echo "[patch:05] Done"
 
               # --- Patch 06a: VM getter (regex) ---
-              # Returns Linux VM instance from getter function
+              # Returns Linux VM instance from getter function. As of 1.28929.0 the minifier
+              # emits native optional chaining, so the body is `return(await X())?.vm??null`
+              # rather than the old `const A=await X();return(A==null?void 0:A.vm)??null`
+              # desugar.
               echo "[patch:06a] Patching VM getter..."
-              perl -i -pe 's{(async function )(\w+)(\(\)\{)(const \w+=await \w+\(\);return\(\w+==null\?void 0:\w+\.vm\)\?\?null)}{$1$2$3if(process.platform==="linux"\&\&global.__linuxCowork\&\&global.__linuxCowork.vmInstance){console.log("[Cowork Linux] $2() returning Linux VM");return global.__linuxCowork.vmInstance}$4}g' "$INDEX"
-              grep -qP '\[Cowork Linux\] \w+\(\) returning Linux VM' "$INDEX" \
-                || { echo "ERROR: patch 06a (VM getter) failed to apply"; exit 1; }
+              patch_js 06a \
+                's{(async function )([\w\$]+)(\(\)\{)(return\(await [\w\$]+\(\)\)\?\.vm\?\?null)}{$1$2$3if(process.platform==="linux"&&global.__linuxCowork&&global.__linuxCowork.vmInstance){console.log("[Cowork Linux] $2() returning Linux VM");return global.__linuxCowork.vmInstance}$4}g' \
+                '\[Cowork Linux\] [\w$]+\(\) returning Linux VM'
               echo "[patch:06a] Done"
 
               # --- Patch 06b: Platform getter (regex) ---
-              # Don't return null for Linux in platform-gated getter.
-              # NOTE: the minifier's identifier alphabet includes `$`, and in 1.24012.11 this
-              # getter is named `$at` (`async function $at(){return process.platform!=="darwin"
-              # ?null:await Eat()}`). Perl's `\w` is [A-Za-z0-9_] and does NOT match `$`, so the
-              # old `\w+` anchor silently missed. Match identifiers with `[\w\$]+` (same fix
-              # already applied to patch 08a).
+              # Don't return null for Linux in the platform-gated Swift-module getter. In
+              # 1.28929.0 the ternary is written the other way round —
+              # `async function kN(){return process.platform===`darwin`?await DN():null}`
+              # (was `...!=="darwin"?null:await ...`) — so widen the darwin test to darwin||linux
+              # instead of narrowing a negated one.
+              # NOTE: the minifier's identifier alphabet includes `$` (e.g. `$at` in 1.24012.11).
+              # Perl's `\w` is [A-Za-z0-9_] and does NOT match `$`, so every identifier capture
+              # must be `[\w\$]+`.
               echo "[patch:06b] Patching platform getter..."
-              perl -i -pe 's{(async function [\w\$]+\(\)\{return )process\.platform!=="darwin"\?null(:await [\w\$]+\(\))}{''${1}process.platform!=="darwin"\&\&process.platform!=="linux"?null''${2}}g' "$INDEX"
-              grep -qP 'process\.platform!=="darwin"&&process\.platform!=="linux"\?null' "$INDEX" \
-                || { echo "ERROR: patch 06b (platform getter) failed to apply"; exit 1; }
+              patch_js 06b \
+                's{(async function [\w\$]+\(\)\{return )process\.platform===["\x60]darwin["\x60](\?await [\w\$]+\(\):null\})}{$1(process.platform==="darwin"||process.platform==="linux")$2}g' \
+                '\(process\.platform==="darwin"\|\|process\.platform==="linux"\)\?await [\w$]+\(\):null'
               echo "[patch:06b] Done"
 
               # --- Patch 07: Platform branding ---
@@ -261,10 +351,13 @@
 
               # --- Patch 08a: Tray icon resource path (regex) ---
               # Returns real filesystem path on Linux (COSMIC SNI can't read from ASAR)
+              # 1.28929.0: the packaged branch is bare `process.resourcesPath` (was aliased
+              # through the electron-namespace var) and `path` is reached as `X.default.resolve`,
+              # so the path helper capture must tolerate an optional `.default` member.
               echo "[patch:08a] Patching tray icon resource path..."
-              perl -i -pe 's{function ([\w\$]+)\(\)\{return (\w+)\.app\.isPackaged\?(\w+)\.resourcesPath:(\w+)\.resolve\(__dirname,"\.\.","\.\.","resources"\)\}}{function $1(){return process.platform==="linux"?$4.join($4.dirname($2.app.getAppPath()),"resources"):$2.app.isPackaged?$3.resourcesPath:$4.resolve(__dirname,"..","..","resources")}}g' "$INDEX"
-              grep -qP 'process\.platform==="linux"\?\w+\.join\(\w+\.dirname\(' "$INDEX" \
-                || { echo "ERROR: patch 08a (tray icon path) failed to apply"; exit 1; }
+              patch_js 08a \
+                's{function ([\w\$]+)\(\)\{return ([\w\$]+)\.app\.isPackaged\?process\.resourcesPath:([\w\$]+(?:\.default)?)\.resolve\(__dirname,["\x60]\.\.["\x60],["\x60]\.\.["\x60],["\x60]resources["\x60]\)\}}{function $1(){return process.platform==="linux"?$3.join($3.dirname($2.app.getAppPath()),"resources"):$2.app.isPackaged?process.resourcesPath:$3.resolve(__dirname,"..","..","resources")}}g' \
+                'process\.platform==="linux"\?[\w$.]+\.join\([\w$.]+\.dirname\('
               echo "[patch:08a] Done"
 
               # --- Patch 08b: Tray icon filename (regex) ---
@@ -274,25 +367,29 @@
               # won't adapt to a dark panel on Linux. Rewrite only the template-image case so
               # Linux picks the dark/light PNG by nativeTheme (matching the existing "png" case),
               # while macOS keeps its OS-adapted template image untouched.
+              # 1.28929.0: the switch discriminant is a member expression (`switch(v.d)`, was a
+              # bare identifier), so the discriminant capture allows dots.
               echo "[patch:08b] Patching tray icon filename selection..."
-              perl -i -pe 's{(switch\(\w+\)\{case"ico":\w+=(\w+)\.nativeTheme\.shouldUseDarkColors\?"Tray-Win32-Dark\.ico":"Tray-Win32\.ico";break;case"template-image":)(\w+)="TrayIconTemplate\.png";break}{$1$3=process.platform==="linux"?($2.nativeTheme.shouldUseDarkColors?"TrayIconTemplate-Dark.png":"TrayIconTemplate.png"):"TrayIconTemplate.png";break}g' "$INDEX"
-              grep -qP 'case"template-image":\w+=process\.platform==="linux"\?\(\w+\.nativeTheme\.shouldUseDarkColors\?"TrayIconTemplate-Dark\.png"' "$INDEX" \
-                || { echo "ERROR: patch 08b (tray icon filename) failed to apply"; exit 1; }
+              patch_js 08b \
+                's{(switch\([\w\$.]+\)\{case["\x60]ico["\x60]:[\w\$]+=([\w\$]+)\.nativeTheme\.shouldUseDarkColors\?["\x60]Tray-Win32-Dark\.ico["\x60]:["\x60]Tray-Win32\.ico["\x60];break;case["\x60]template-image["\x60]:)([\w\$]+)=["\x60]TrayIconTemplate\.png["\x60];break}{$1$3=process.platform==="linux"?($2.nativeTheme.shouldUseDarkColors?"TrayIconTemplate-Dark.png":"TrayIconTemplate.png"):"TrayIconTemplate.png";break}g' \
+                'template-image["\x60]:[\w$]+=process\.platform==="linux"\?\([\w$]+\.nativeTheme\.shouldUseDarkColors\?"TrayIconTemplate-Dark\.png"'
               echo "[patch:08b] Done"
 
-              # --- Patch 10: Claude Code (CCD) host platform (regex) ---
-              # The Claude Code-for-Desktop binary resolver's getHostPlatform() maps
-              # darwin/win32 to a target triple and throws "Unsupported platform" on anything
-              # else. On Linux that throw propagates up as "Failed to get commands from
-              # temporary query" (the local-binary override path is dead code in this build,
-              # so the throw is unavoidable otherwise). Teach it the linux targets — Anthropic
-              # ships linux CCD binaries (the macOS Cowork VM is itself Linux), so resolution
-              # can proceed via the normal preseed/download path instead of throwing.
-              echo "[patch:10] Patching Claude Code host platform..."
-              perl -i -pe 's{(getHostPlatform\(\)\{const (\w+)=process\.arch;if\(process\.platform==="darwin"\)return \2==="arm64"\?"darwin-arm64":"darwin-x64";if\(process\.platform==="win32"\)return \2==="arm64"\?"win32-arm64":"win32-x64";)}{$1if(process.platform==="linux")return $2==="arm64"?"linux-arm64":"linux-x64";}g' "$INDEX"
-              grep -qP 'if\(process\.platform==="linux"\)return \w+==="arm64"\?"linux-arm64":"linux-x64"' "$INDEX" \
-                || { echo "ERROR: patch 10 (CCD host platform) failed to apply"; exit 1; }
-              echo "[patch:10] Done"
+              # --- Patch 10: Claude Code (CCD) host platform — REMOVED (upstream) ---
+              # The Claude Code-for-Desktop binary resolver's getHostPlatform() used to map only
+              # darwin/win32 to a target triple and throw "Unsupported platform" on anything else,
+              # which surfaced on Linux as "Failed to get commands from temporary query". This
+              # patch injected the linux-x64/linux-arm64 branch. As of 1.28929.0 upstream ships
+              # exactly that branch itself:
+              #   getHostPlatform(){let e=process.arch;...;if(process.platform===`linux`)
+              #     return e===`arm64`?`linux-arm64`:`linux-x64`;throw Error(...)}
+              # so the injection has nothing left to add. Keep the assertion, though: if a future
+              # release drops the linux branch again, CCD silently regresses to the throw, and a
+              # hard build failure here is how we find out.
+              echo "[patch:10] Verifying upstream Linux host platform support..."
+              grep -qP 'if\(process\.platform===["\x60]linux["\x60]\)return [\w$]+===["\x60]arm64["\x60]\?["\x60]linux-arm64["\x60]:["\x60]linux-x64["\x60]' "''${CHUNKS[@]}" \
+                || { echo "ERROR: patch 10 — upstream getHostPlatform() no longer handles linux; re-add the injection"; exit 1; }
+              echo "[patch:10] Done (native)"
 
               # --- Patch 11: Shell-env worker path (regex) ---
               # The shell-PATH extractor forks shellPathWorker.js, but resolves it relative to
@@ -302,10 +399,13 @@
               # losing the user's real PATH for MCP servers and Cowork tools. Resolve via
               # __dirname (the asar dir of index.js) on Linux; the worker is forked from inside
               # the asar just as it is on macOS.
+              # __dirname resolves to .vite/build for every code-split chunk as well as for
+              # index.js — they are all emitted side by side — so the Linux branch is correct
+              # whichever chunk the helper ends up in.
               echo "[patch:11] Patching shell-env worker path..."
-              perl -i -pe 's{function (\w+)\(\)\{return (\w+)\.join\(process\.resourcesPath,"app\.asar","\.vite","build","shell-path-worker","shellPathWorker\.js"\)\}}{function $1(){return process.platform==="linux"?$2.join(__dirname,"shell-path-worker","shellPathWorker.js"):$2.join(process.resourcesPath,"app.asar",".vite","build","shell-path-worker","shellPathWorker.js")}}g' "$INDEX"
-              grep -qP 'process\.platform==="linux"\?\w+\.join\(__dirname,"shell-path-worker","shellPathWorker\.js"\)' "$INDEX" \
-                || { echo "ERROR: patch 11 (shell-env worker path) failed to apply"; exit 1; }
+              patch_js 11 \
+                's{function ([\w\$]+)\(\)\{return ([\w\$]+(?:\.default)?)\.join\(process\.resourcesPath,["\x60]app\.asar["\x60],["\x60]\.vite["\x60],["\x60]build["\x60],["\x60]shell-path-worker["\x60],["\x60]shellPathWorker\.js["\x60]\)\}}{function $1(){return process.platform==="linux"?$2.join(__dirname,"shell-path-worker","shellPathWorker.js"):$2.join(process.resourcesPath,"app.asar",".vite","build","shell-path-worker","shellPathWorker.js")}}g' \
+                'process\.platform==="linux"\?[\w$.]+\.join\(__dirname,"shell-path-worker","shellPathWorker\.js"\)'
               echo "[patch:11] Done"
 
               # --- Patch 12: Tray in-place update — REMOVED ---
@@ -350,10 +450,13 @@
               # MUST be written [\w\$]: an unescaped $] interpolates the $] Perl-version
               # variable inside the char class -> "Invalid [] range". PCRE (grep -P) does not
               # interpolate $, so plain [\w$] is correct (and required) there.
+              #
+              # v1.28929.0 note: the menu builder is now reached as a member call (`dm=i.p()`,
+              # was a bare `FcA=EXe()`), so the builder capture allows one `.member` hop.
               echo "[patch:18] Patching tray native context menu (Linux)..."
-              perl -i -pe 's{([\w\$]+)=([\w\$]+)\(\),(([\w\$]+)\.on\("click",\(\)=>void [\w\$]+\(\)\)),(\4\.on\("right-click")}{$1=$2(),process.platform==="linux"&&$4.setContextMenu($1),$3,process.platform!=="linux"&&$5}g' "$INDEX"
-              grep -qP 'process\.platform==="linux"&&[\w$]+\.setContextMenu\([\w$]+\),[\w$]+\.on\("click"' "$INDEX" \
-                || { echo "ERROR: patch 18 (tray native context menu) failed to apply"; exit 1; }
+              patch_js 18 \
+                's{([\w\$]+)=([\w\$]+(?:\.[\w\$]+)?\(\)),(([\w\$]+)\.on\(["\x60]click["\x60],\(\)=>void [\w\$]+\(\)\)),(\4\.on\(["\x60]right-click)}{$1=$2,process.platform==="linux"&&$4.setContextMenu($1),$3,process.platform!=="linux"&&$5}g' \
+                'process\.platform==="linux"&&[\w$]+\.setContextMenu\([\w$]+\),[\w$]+\.on\(["\x60]click["\x60]'
               echo "[patch:18] Done"
 
               # --- Patch 13: macOS-only systemPreferences.setUserDefault guard (regex) ---
@@ -365,9 +468,9 @@
               # leaving the trailing comma-sequence — e.g. ...,GCo() — to run untouched). The
               # other systemPreferences.* calls are already darwin-gated or runtime/try-catch'd.
               echo "[patch:13] Patching systemPreferences.setUserDefault guard..."
-              perl -i -pe 's{(\w+)\.systemPreferences\.setUserDefault\(}{process.platform==="darwin"\&\&$1.systemPreferences.setUserDefault(}g' "$INDEX"
-              grep -qP 'process\.platform==="darwin"&&\w+\.systemPreferences\.setUserDefault\(' "$INDEX" \
-                || { echo "ERROR: patch 13 (setUserDefault guard) failed to apply"; exit 1; }
+              patch_js 13 \
+                's{([\w\$]+)\.systemPreferences\.setUserDefault\(}{process.platform==="darwin"&&$1.systemPreferences.setUserDefault(}g' \
+                'process\.platform==="darwin"&&[\w$]+\.systemPreferences\.setUserDefault\('
               echo "[patch:13] Done"
 
               # --- Patch 14: macOS-only app.configureWebAuthn guard (regex) ---
@@ -378,9 +481,9 @@
               # startup crash after patch 13. Gate it behind a darwin check (Anthropic ships it
               # working on macOS; on Linux the `&&` short-circuits to a no-op).
               echo "[patch:14] Patching app.configureWebAuthn guard..."
-              perl -i -pe 's{(\w+)\.app\.configureWebAuthn\(}{process.platform==="darwin"\&\&$1.app.configureWebAuthn(}g' "$INDEX"
-              grep -qP 'process\.platform==="darwin"&&\w+\.app\.configureWebAuthn\(' "$INDEX" \
-                || { echo "ERROR: patch 14 (configureWebAuthn guard) failed to apply"; exit 1; }
+              patch_js 14 \
+                's{([\w\$]+)\.app\.configureWebAuthn\(}{process.platform==="darwin"&&$1.app.configureWebAuthn(}g' \
+                'process\.platform==="darwin"&&[\w$]+\.app\.configureWebAuthn\('
               echo "[patch:14] Done"
 
               # --- Patch 15: macOS-only BrowserWindow method guards (regex) ---
@@ -395,15 +498,15 @@
               # runs; on Linux it short-circuits to a no-op. The already-darwin-gated
               # setHiddenInMissionControl sites are unaffected (method still exists on macOS).
               echo "[patch:15a] Patching setWindowButtonPosition..."
-              perl -i -pe 's{(\.setWindowButtonPosition)\(}{$1?.(}g' "$INDEX"
-              grep -qP '\.setWindowButtonPosition\?\.\(' "$INDEX" \
-                || { echo "ERROR: patch 15a (setWindowButtonPosition) failed to apply"; exit 1; }
+              patch_js 15a \
+                's{(\.setWindowButtonPosition)\(}{$1?.(}g' \
+                '\.setWindowButtonPosition\?\.\('
               echo "[patch:15a] Done"
 
               echo "[patch:15b] Patching setHiddenInMissionControl..."
-              perl -i -pe 's{(\.setHiddenInMissionControl)\(}{$1?.(}g' "$INDEX"
-              grep -qP '\.setHiddenInMissionControl\?\.\(' "$INDEX" \
-                || { echo "ERROR: patch 15b (setHiddenInMissionControl) failed to apply"; exit 1; }
+              patch_js 15b \
+                's{(\.setHiddenInMissionControl)\(}{$1?.(}g' \
+                '\.setHiddenInMissionControl\?\.\('
               echo "[patch:15b] Done"
 
               # --- Patch 16: Claude Code native-binary loader shim (append) ---
@@ -443,10 +546,15 @@
               # That dir lives in the read-only Nix store, so no attacker can plant HTML there —
               # this only re-grants first-party bundled renderers the access macOS gets for free
               # via isPackaged, and leaves the claude.ai (https:) allowlist path untouched.
+              #
+              # v1.28929.0 note: the leading `var <tmp>;` (the old optional-chaining desugar
+              # temp) is gone now that the minifier emits native `?.`, so it is no longer part
+              # of the anchor. The 9 validators are spread over 8 chunks, which is exactly why
+              # patches run across the whole file set rather than one resolved bundle.
               echo "[patch:17] Patching eIPC origin validation for renderer windows..."
-              perl -i -pe 's{(function (\w+)\((\w+)\)\{var \w+;if\(!\3\.senderFrame\|\|!\3\.senderFrame\.url\)return!1;)}{$1if(process.platform==="linux"\&\&$3.senderFrame.parent===null\&\&$3.senderFrame.url.startsWith("file:")\&\&$3.senderFrame.url.includes("/.vite/renderer/"))return!0;}g' "$INDEX"
-              grep -qP 'if\(process\.platform==="linux"&&\w+\.senderFrame\.parent===null&&\w+\.senderFrame\.url\.startsWith\("file:"\)&&\w+\.senderFrame\.url\.includes\("/\.vite/renderer/"\)\)return!0;' "$INDEX" \
-                || { echo "ERROR: patch 17 (eIPC origin validation) failed to apply"; exit 1; }
+              patch_js 17 \
+                's{(function [\w\$]+\(([\w\$]+)\)\{if\(!\2\.senderFrame\|\|!\2\.senderFrame\.url\)return!1;)}{$1if(process.platform==="linux"&&$2.senderFrame.parent===null&&$2.senderFrame.url.startsWith("file:")&&$2.senderFrame.url.includes("/.vite/renderer/"))return!0;}g' \
+                'if\(process\.platform==="linux"&&[\w$]+\.senderFrame\.parent===null&&[\w$]+\.senderFrame\.url\.startsWith\("file:"\)&&[\w$]+\.senderFrame\.url\.includes\("/\.vite/renderer/"\)\)return!0;'
               echo "[patch:17] Done"
 
               # --- Patch 09: DBus tray cleanup delay — REMOVED ---
@@ -467,8 +575,12 @@
               # function (as the old tray patch 09 did in 1.11847.5) builds fine but throws
               # "SyntaxError: Unexpected token" at startup. `node --check` is the parser, so
               # this turns that whole class of silent breakage into a hard build failure.
+              # Extra important now that patches run across every chunk: index.pre.js wraps its
+              # `require("./index.js")` in a try/catch that funnels the error into the crash
+              # reporter, so a SyntaxError in a patched chunk does NOT produce an obvious startup
+              # failure — it produces a silently half-dead app.
               echo "[verify] Syntax-checking patched JavaScript..."
-              for jsfile in "$INDEX" "$MAINVIEW"; do
+              for jsfile in "''${CHUNKS[@]}"; do
                 ${pkgs.nodejs}/bin/node --check "$jsfile" \
                   || { echo "ERROR: $jsfile failed 'node --check' after patching (broken JS)"; exit 1; }
               done

@@ -12,13 +12,34 @@ const fs = require('fs');
 const path = require('path');
 
 const EXTRACTED_DIR = process.argv[2] || '/tmp/app-extracted';
-// argv[3], when provided by the flake, is the resolved main-process bundle path.
-// v1.22209.3 code-splits index.js into a loader stub + index.chunk-<hash>.js, and
-// the [VM:start] function lives in that chunk. Fall back to the monolithic index.js
-// for older, unsplit builds.
-const INDEX_JS_PATH = process.argv[3] || path.join(EXTRACTED_DIR, '.vite/build/index.js');
+const BUILD_DIR = path.join(EXTRACTED_DIR, '.vite/build');
+
+// The main process is code-split, and which chunk owns the [VM:start] function moves
+// between releases (1.22209.3: one big index.chunk-<hash>.js; 1.28929.0: ~350 chunks,
+// with [VM:start] in index.chunk-YyyEUQig.js). Find the owner by content instead of
+// being told which file to patch. argv[3] still overrides for manual runs.
+function findVmStartFile() {
+  if (process.argv[3]) return process.argv[3];
+  const hits = fs
+    .readdirSync(BUILD_DIR)
+    .filter((f) => f.endsWith('.js'))
+    .map((f) => path.join(BUILD_DIR, f))
+    .filter((p) => fs.readFileSync(p, 'utf8').includes('[VM:start]'));
+  if (hits.length === 0) {
+    console.error(`  ERROR: no file under ${BUILD_DIR} contains the [VM:start] log string`);
+    process.exit(1);
+  }
+  if (hits.length > 1) {
+    console.error(`  ERROR: [VM:start] found in ${hits.length} files: ${hits.join(', ')}`);
+    process.exit(1);
+  }
+  return hits[0];
+}
 
 console.log('=== Dynamic Patch: VM Start Intercept ===\n');
+
+const INDEX_JS_PATH = findVmStartFile();
+console.log(`  Main-process chunk: ${path.basename(INDEX_JS_PATH)}`);
 
 let content = fs.readFileSync(INDEX_JS_PATH, 'utf8');
 
@@ -34,7 +55,9 @@ if (vmStartIdx === -1) {
   process.exit(1);
 }
 
-const declRe = /async function (\w+)\((\w+),(\w+),(\w+),(\w+)\)\{/g;
+// The minifier's identifier alphabet includes `$`, so identifier classes must be
+// [\w$], not \w.
+const declRe = /async function ([\w$]+)\(([\w$]+),([\w$]+),([\w$]+),([\w$]+)\)\{/g;
 let m, decl = null;
 while ((m = declRe.exec(content)) !== null) {
   if (m.index >= vmStartIdx) break;
@@ -64,9 +87,16 @@ console.log(`  Found VM start function: ${funcName}(${params.join(',')})`);
 // Discover the status dispatch: the readiness notifier called immediately before
 // the `lam_vm_startup_completed` analytics event (historically `WORD(WORD.Ready)`,
 // now a zero-arg notifier such as `orA()`). Best-effort; falls back to a log.
+// As of 1.28929.0 the minifier emits backtick string literals and the analytics
+// emitter is a member call (`Ze(),i.B(`lam_vm_startup_completed`,...)`), so both
+// patterns accept either quote style and an optional `.member` on the emitter.
 let statusDispatch = 'console.log("[Cowork Linux] Ready")';
-const readyArgMatch = content.match(/(\w+)\((\w+)\.Ready\),\w+\("lam_vm_startup_completed"/);
-const readyCallMatch = content.match(/(\w+\(\)),\w+\("lam_vm_startup_completed"/);
+const readyArgMatch = content.match(
+  /([\w$]+)\(([\w$]+)\.Ready\),[\w$.]+\(["`]lam_vm_startup_completed["`]/
+);
+const readyCallMatch = content.match(
+  /([\w$]+\(\)),[\w$.]+\(["`]lam_vm_startup_completed["`]/
+);
 if (readyArgMatch) {
   statusDispatch = `${readyArgMatch[1]}(${readyArgMatch[2]}.Ready)`;
   console.log(`  Found status dispatch: ${statusDispatch}`);
@@ -101,7 +131,10 @@ const injection = `${declStr}
       const __resolveCommand=(cmd)=>{
         if(cmd!=="claude")return cmd;
         try{
-          const base=nodePath.join(oA.app.getPath("userData"),"claude-code");
+          // require("electron") rather than a minified module-scope alias: the injected
+          // code now lands in whichever code-split chunk owns [VM:start], where the old
+          // hardcoded alias (oA) does not exist. electron is always resolvable in main.
+          const base=nodePath.join(require("electron").app.getPath("userData"),"claude-code");
           const vers=nodeFs.readdirSync(base).filter(d=>{try{return nodeFs.existsSync(nodePath.join(base,d,"claude"))}catch(e){return false}}).sort();
           const pick=vers.slice().reverse().find(d=>nodeFs.existsSync(nodePath.join(base,d,".verified")))||vers[vers.length-1];
           if(pick)return nodePath.join(base,pick,"claude");
