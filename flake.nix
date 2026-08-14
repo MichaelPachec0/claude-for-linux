@@ -682,6 +682,10 @@
           '';
 
           # Basic Claude Desktop package: detaching launcher + desktop entry + icons.
+          # Icon=claude below is a hicolor theme NAME, not a path, so the package
+          # must also ship share/icons/hicolor/<size>/apps/claude.png — that comes
+          # from claudeApp in paths. Drop claudeApp and the entry renders iconless
+          # in rofi/quickshell/any XDG menu.
           claudeDesktop = pkgs.symlinkJoin {
             name = "claude-desktop-${claudeVersion}";
             paths = [ (mkDetachingLauncher "${claudeDesktopForeground}/bin/claude-desktop") claudeApp ];
@@ -751,7 +755,15 @@
           # doesn't swallow the launching terminal.
           claudeDesktopFHS = pkgs.symlinkJoin {
             name = "claude-desktop-fhs-${claudeVersion}";
-            paths = [ (mkDetachingLauncher "${claudeDesktopFHSInner}/bin/claude-desktop") ];
+            # claudeApp is joined in for share/icons/hicolor/*/apps/claude.png.
+            # Without it the desktop entry's Icon=claude resolves to nothing and
+            # launchers (rofi, quickshell, any XDG menu) show a blank/fallback
+            # icon. The FHS sandbox itself only needs claudeDesktopFHSInner; the
+            # app payload here is inert symlinks.
+            paths = [
+              (mkDetachingLauncher "${claudeDesktopFHSInner}/bin/claude-desktop")
+              claudeApp
+            ];
             meta = with pkgs.lib; {
               description = "Claude Desktop for Linux (FHS) with Cowork and MCP support";
               homepage = "https://claude.ai";
