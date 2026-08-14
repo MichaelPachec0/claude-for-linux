@@ -649,13 +649,13 @@
                 --add-flags "$out/lib/claude-desktop/app.asar" \
                 --add-flags "--no-sandbox" \
                 --add-flags "--ozone-platform-hint=auto" \
-                --add-flags "--class=Claude" \
+                --add-flags "--class=com.anthropic.Claude" \
                 --add-flags "--password-store=gnome-libsecret" \
                 --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.bubblewrap ]} \
                 --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libsecret ]} \
                 --set BWRAP_PATH "${pkgs.bubblewrap}/bin/bwrap" \
                 --set COWORK_SANDBOX_GLIBC "${pkgs.glibc}/lib" \
-                --set CHROME_DESKTOP "claude-desktop.desktop" \
+                --set CHROME_DESKTOP "com.anthropic.Claude.desktop" \
                 --prefix XDG_DATA_DIRS : "$out/share"
             '';
           };
@@ -690,9 +690,14 @@
             name = "claude-desktop-${claudeVersion}";
             paths = [ (mkDetachingLauncher "${claudeDesktopForeground}/bin/claude-desktop") claudeApp ];
             postBuild = ''
-              # Desktop entry
+              # Desktop entry. The basename and StartupWMClass must both equal the
+              # Wayland app_id Electron actually reports (com.anthropic.Claude,
+              # verified with `hyprctl clients`) — NOT "claude-desktop"/"Claude".
+              # Panels and taskbars map a live toplevel to its entry by app_id, so
+              # any other name leaves running windows iconless even though menus
+              # like rofi (which never see app_id) look fine.
               mkdir -p $out/share/applications
-              cat > $out/share/applications/claude-desktop.desktop <<DESKTOP
+              cat > $out/share/applications/com.anthropic.Claude.desktop <<DESKTOP
               [Desktop Entry]
               Name=Claude
               Comment=Claude AI Assistant
@@ -701,9 +706,9 @@
               Type=Application
               Categories=Development;Utility;
               MimeType=x-scheme-handler/claude;
-              StartupWMClass=Claude
+              StartupWMClass=com.anthropic.Claude
               DESKTOP
-              sed -i 's/^              //' $out/share/applications/claude-desktop.desktop
+              sed -i 's/^              //' $out/share/applications/com.anthropic.Claude.desktop
             '';
             meta = with pkgs.lib; {
               description = "Claude Desktop for Linux with Cowork support";
@@ -862,7 +867,11 @@
           config = lib.mkIf cfg.enable {
             home.packages = [ pkg pkgs.bubblewrap ];
 
-            xdg.desktopEntries.claude-desktop = lib.mkIf cfg.createDesktopEntry {
+            # Attribute name is the .desktop basename, and it must equal the
+            # Wayland app_id Electron reports (com.anthropic.Claude) so panels and
+            # taskbars can map a live window back to this entry for its icon.
+            # Same reason StartupWMClass carries the app_id rather than "Claude".
+            xdg.desktopEntries."com.anthropic.Claude" = lib.mkIf cfg.createDesktopEntry {
               name = "Claude";
               genericName = "AI Assistant";
               exec = "${pkg}/bin/claude-desktop %U";
@@ -871,7 +880,7 @@
               comment = "Claude Desktop with Linux Cowork support";
               mimeType = [ "x-scheme-handler/claude" ];
               settings = {
-                StartupWMClass = "Claude";
+                StartupWMClass = "com.anthropic.Claude";
               };
             };
           };
