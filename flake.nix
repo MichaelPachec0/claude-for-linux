@@ -260,9 +260,14 @@
               # Patch 04 makes the VM-bundle download a no-op on Linux, but the renderer does
               # not ask "did the download run" — it asks the CoworkVM eIPC interface for the
               # bundle's state on disk:
-              #   getDownloadStatus(){return j.d()?E.u.Downloading:j.u()?E.u.Ready:E.u.NotDownloaded}
-              #   async download(){try{return await j.r(),{success:j.u()}}catch...}
-              # `j.u()` is the bundle-file readiness probe (every macOS VM bundle file present
+              #   getDownloadStatus(){return hK()?WO.Downloading:mK()?WO.Ready:WO.NotDownloaded}
+              #   async download(){try{return await dK(),{success:mK()}}catch...}
+              # 1.30096.1: the probes used to be namespaced member calls (`j.u()`) and the enum a
+              # two-level member (`E.u.Ready`); the minifier now emits bare hoisted identifiers
+              # (`mK()`, `WO`). Both captures therefore allow dots but no longer require them.
+              # (The eIPC interface was also renamed CoworkVM -> ClaudeVM; the anchors never
+              # matched on the interface name, so that rename is inert here.)
+              # `mK()` is the bundle-file readiness probe (every macOS VM bundle file present
               # and hash-matched under <userData>/…). On Linux nothing is ever downloaded, so it
               # returns false forever: the Cowork tab shows the "Get set up for agent mode —
               # download a one-time package" card, and pressing it reports {success:false} (patch
@@ -272,13 +277,13 @@
               # bundle to install; the "workspace" is created per session by patch 05.
               echo "[patch:19a] Patching Cowork download status..."
               patch_js 19a \
-                's{(getDownloadStatus\(\)\{)(return [\w\$]+\.[\w\$]+\(\)\?([\w\$]+\.[\w\$]+)\.Downloading:)}{$1if(process.platform==="linux"&&global.__linuxCowork)return $3.Ready;$2}g' \
+                's{(getDownloadStatus\(\)\{)(return [\w\$.]+\(\)\?([\w\$.]+)\.Downloading:)}{$1if(process.platform==="linux"&&global.__linuxCowork)return $3.Ready;$2}g' \
                 'getDownloadStatus\(\)\{if\(process\.platform==="linux"&&global\.__linuxCowork\)return [\w$.]+\.Ready;'
               echo "[patch:19a] Done"
 
               echo "[patch:19b] Patching Cowork download result..."
               patch_js 19b \
-                's{(async download\(\)\{)(try\{return await [\w\$]+\.[\w\$]+\(\),\{success:)}{$1if(process.platform==="linux"&&global.__linuxCowork)return{success:!0};$2}g' \
+                's{(async download\(\)\{)(try\{return await [\w\$.]+\(\),\{success:)}{$1if(process.platform==="linux"&&global.__linuxCowork)return{success:!0};$2}g' \
                 'async download\(\)\{if\(process\.platform==="linux"&&global\.__linuxCowork\)return\{success:!0\};'
               echo "[patch:19b] Done"
 
@@ -361,18 +366,25 @@
               echo "[patch:08a] Done"
 
               # --- Patch 08b: Tray icon filename (regex) ---
-              # Linux uses theme-aware PNGs instead of Windows ICOs. The filename is now chosen
-              # by `switch(Y1r){case"ico":...;case"template-image":e="TrayIconTemplate.png";...}`
-              # where Y1r is hardcoded "template-image" — a flat (non-theme-aware) icon that
-              # won't adapt to a dark panel on Linux. Rewrite only the template-image case so
-              # Linux picks the dark/light PNG by nativeTheme (matching the existing "png" case),
-              # while macOS keeps its OS-adapted template image untouched.
-              # 1.28929.0: the switch discriminant is a member expression (`switch(v.d)`, was a
-              # bare identifier), so the discriminant capture allows dots.
+              # Linux uses theme-aware PNGs instead of Windows ICOs. The filename is chosen by a
+              # switch over a build-time constant that is hardcoded to "template-image" in the
+              # macOS build, so Linux lands on the flat, non-theme-aware mac template icon that
+              # cannot adapt to a dark panel. Rewrite only the template-image case so Linux picks
+              # a dark/light PNG by nativeTheme, while macOS keeps its OS-adapted template image.
+              #
+              # 1.30096.1 shape (was `X=<name>;break` assignments, now direct returns):
+              #   switch(vje){case`ico`:return!e&&o.nativeTheme.shouldUseDarkColors?`Tray-Win32-Dark.ico`:`Tray-Win32.ico`;
+              #               case`template-image`:return`TrayIconTemplate.png`;
+              #               case`png`:return e||dIt()===`gnome`||o.nativeTheme.shouldUseDarkColors?`TrayIconLinux-Dark.png`:`TrayIconLinux.png`;
+              # That `png` case and its TrayIconLinux{,-Dark}.png assets are new upstream Linux
+              # art, but it is unreachable: the discriminant is `vje=`template-image`` — a mac
+              # build constant, not a runtime platform check. So the patch stays, and now returns
+              # upstream's own Linux icons rather than the mac template pair.
+              # The ico-case prefix is matched loosely ([^;]*?) because it grew a `!e&&` guard.
               echo "[patch:08b] Patching tray icon filename selection..."
               patch_js 08b \
-                's{(switch\([\w\$.]+\)\{case["\x60]ico["\x60]:[\w\$]+=([\w\$]+)\.nativeTheme\.shouldUseDarkColors\?["\x60]Tray-Win32-Dark\.ico["\x60]:["\x60]Tray-Win32\.ico["\x60];break;case["\x60]template-image["\x60]:)([\w\$]+)=["\x60]TrayIconTemplate\.png["\x60];break}{$1$3=process.platform==="linux"?($2.nativeTheme.shouldUseDarkColors?"TrayIconTemplate-Dark.png":"TrayIconTemplate.png"):"TrayIconTemplate.png";break}g' \
-                'template-image["\x60]:[\w$]+=process\.platform==="linux"\?\([\w$]+\.nativeTheme\.shouldUseDarkColors\?"TrayIconTemplate-Dark\.png"'
+                's{(switch\([\w\$.]+\)\{case["\x60]ico["\x60]:return[^;]*?([\w\$]+)\.nativeTheme\.shouldUseDarkColors\?["\x60]Tray-Win32-Dark\.ico["\x60]:["\x60]Tray-Win32\.ico["\x60];case["\x60]template-image["\x60]:return)["\x60]TrayIconTemplate\.png["\x60]}{$1 process.platform==="linux"?($2.nativeTheme.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"):"TrayIconTemplate.png"}g' \
+                'template-image["\x60]:return process\.platform==="linux"\?\([\w$]+\.nativeTheme\.shouldUseDarkColors\?"TrayIconLinux-Dark\.png"'
               echo "[patch:08b] Done"
 
               # --- Patch 10: Claude Code (CCD) host platform — REMOVED (upstream) ---
@@ -611,7 +623,9 @@
               # COSMIC's SNI can't read from inside ASAR archives, so these must
               # be on the real filesystem for the tray icon to display correctly.
               mkdir -p $out/lib/claude-desktop/resources
-              for icon in extracted/resources/TrayIconTemplate*.png extracted/resources/icon.png; do
+              # TrayIconLinux{,-Dark}.png are what patch 08b selects on Linux (upstream
+              # added them in 1.30096.1); without them here the tray renders blank.
+              for icon in extracted/resources/TrayIconTemplate*.png extracted/resources/TrayIconLinux*.png extracted/resources/icon.png; do
                 if [ -f "$icon" ]; then
                   cp "$icon" $out/lib/claude-desktop/resources/
                 fi
