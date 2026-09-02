@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.30096.1";
-      claudeDmgHash = "sha256-G1RrYqxY3fWrJ6GKUqBjiQzwKzVhJnNiaeV5nQj0H84=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-194d93c2558cfbfcd2b8b7a90e02774c489d1875.dmg";
+      claudeVersion = "1.44121.0";
+      claudeDmgHash = "sha256-4hzTf/KRiAN3BU5SR4oOGrOYLpmjr71V7fIdzeF+Uwc=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-a670de389e37e5e93692c0aedf350fe0d2cde4c1.dmg";
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
 
@@ -250,9 +250,15 @@
               # — a unique, stable signature. The old anchor was "any two-arg async function
               # within 200 chars of a [downloadVM] log string", which also matched the unrelated
               # stale-cache sweeper in the same chunk.
+              # 1.44121.0: the body now opens with an awaited feature-gate fetch
+              # (`async function sU(e,t){await Lz();let{yukonSilver:r}=zz();...`), so the
+              # anchor allows one optional `await X();` statement before the destructure.
+              # The other yukonSilver destructures in the bundle keep different arities or
+              # preambles (3-arg warm-downloader, Date.now() in the startVM wrapper), so the
+              # match stays unique.
               echo "[patch:04] Patching download skip..."
               patch_js 04 \
-                's{(async function [\w\$]+\([\w\$]+,[\w\$]+\)\{)(let\{yukonSilver:)}{$1if(process.platform==="linux"&&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' \
+                's{(async function [\w\$]+\([\w\$]+,[\w\$]+\)\{(?:await [\w\$]+\(\);)?)(let\{yukonSilver:)}{$1if(process.platform==="linux"&&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' \
                 'if\(process\.platform==="linux"&&global\.__linuxCowork\)\{console\.log\("\[Cowork Linux\] Skipping bundle download"\)'
               echo "[patch:04] Done"
 
@@ -304,15 +310,24 @@
               #   "Claude Code native binary not found at .../Helpers/disclaimer"
               #   (error_category: disclaimer_binary_missing)
               # which the UI reports as "The Claude Code binary is missing or damaged."
-              # There is nothing for the helper to do on Linux (no TCC), so make the wrapper a
-              # pass-through there: the SDK gets the real binary as the executable and an empty
-              # argv, exactly as if the helper had exec'd it. Patching the wrapper rather than the
-              # resolver covers all of its callers (host loop, usage probe, dev-server detect,
-              # spawnAsync) in one place, and leaves the macOS path byte-identical.
-              echo "[patch:20] Patching macOS disclaimer helper wrapper..."
+              # There is nothing for the helper to do on Linux (no TCC), so route around it.
+              # 1.44121.0 reshaped this site: the single pass-through wrapper
+              # (`function o(e){return{cmd:a(),args:[e.cmd,...e.args]}}`) is now a resolver
+              # pair plus TWO wrappers that each null-check the resolver themselves:
+              #   function NKe(){{let e=path.dirname(process.resourcesPath);return path.join(e,"Helpers","disclaimer")}}
+              #   function PKe(){return NKe()}
+              #   function Sp(e){let t=PKe();if(!t)return{cmd:e.cmd,args:e.args,processGroupLeader:!1};...--pgroup...}
+              #   function RKe(e){let t=PKe();return t?{cmd:t,args:["--ports-only",...]}:e}
+              # i.e. upstream itself ships a no-helper pass-through path behind a falsy
+              # resolver. So patch the resolver instead of the wrappers: make the
+              # `function X(){return Y()}` that immediately follows the Helpers/disclaimer
+              # path builder return null on Linux. Both wrappers (and any future caller
+              # that copies the null-check idiom) then take upstream's own pass-through,
+              # and the macOS path stays byte-identical.
+              echo "[patch:20] Patching macOS disclaimer helper resolver..."
               patch_js 20 \
-                's{function ([\w\$]+)\(([\w\$]+)\)\{return\{cmd:([\w\$]+)\(\),args:\[\2\.cmd,\.\.\.\2\.args\]\}\}}{function $1($2){return process.platform==="linux"?{cmd:$2.cmd,args:$2.args}:{cmd:$3(),args:[$2.cmd,...$2.args]}}}g' \
-                'return process\.platform==="linux"\?\{cmd:[\w$]+\.cmd,args:[\w$]+\.args\}:\{cmd:[\w$]+\(\),args:\['
+                's{(["\x60]disclaimer["\x60]\)\}\})function ([\w\$]+)\(\)\{return ([\w\$]+)\(\)\}}{$1function $2(){return process.platform==="linux"?null:$3()}}g' \
+                'function [\w$]+\(\)\{return process\.platform==="linux"\?null:[\w$]+\(\)\}'
               echo "[patch:20] Done"
 
               # --- Patch 05: VM start intercept (dynamic Node.js) ---
@@ -465,10 +480,22 @@
               #
               # v1.28929.0 note: the menu builder is now reached as a member call (`dm=i.p()`,
               # was a bare `FcA=EXe()`), so the builder capture allows one `.member` hop.
+              #
+              # v1.44121.0 note: the old anchor (menu-build assignment immediately followed by
+              # the click/right-click pair) is gone. The tray builder now (a) inserts a status
+              # subscription between the menu build and the handler wiring, (b) wires click as
+              # `Q9.on("click",(()=>{H4r()||j3r()}))` (was `()=>void X()`), and (c) rebuilds the
+              # menu LAZILY inside the right-click handler behind a dirty flag before
+              # `Q9?.popUpContextMenu(b3r)`. Re-anchor on the click+right-click pair itself and
+              # capture the menu variable out of the popUpContextMenu call; the menu is already
+              # built (`b3r=S3n()`) before the handlers are wired, so setContextMenu($menu) at
+              # wiring time hands the panel the same menu the popup would have shown. Linux
+              # loses only the lazy rebuild-on-dirty, which the old native path never had
+              # either (the panel re-reads the dbusmenu tree it was handed).
               echo "[patch:18] Patching tray native context menu (Linux)..."
               patch_js 18 \
-                's{([\w\$]+)=([\w\$]+(?:\.[\w\$]+)?\(\)),(([\w\$]+)\.on\(["\x60]click["\x60],\(\)=>void [\w\$]+\(\)\)),(\4\.on\(["\x60]right-click)}{$1=$2,process.platform==="linux"&&$4.setContextMenu($1),$3,process.platform!=="linux"&&$5}g' \
-                'process\.platform==="linux"&&[\w$]+\.setContextMenu\([\w$]+\),[\w$]+\.on\(["\x60]click["\x60]'
+                's{(([\w\$]+)\.on\(["\x60]click["\x60],\(\(\)=>\{[\w\$]+\(\)\|\|[\w\$]+\(\)\}\)\)),(\2\.on\(["\x60]right-click["\x60],\(\(\)=>\{\(async\(\)=>\{.{0,400}?\2\?\.popUpContextMenu\(([\w\$]+)\)\)\}\)\(\)\}\)\))}{$1,process.platform==="linux"&&$2.setContextMenu($4),process.platform!=="linux"&&$3}g' \
+                'process\.platform==="linux"&&[\w$]+\.setContextMenu\([\w$]+\),process\.platform!=="linux"&&[\w$]+\.on\(["\x60]right-click'
               echo "[patch:18] Done"
 
               # --- Patch 13: macOS-only systemPreferences.setUserDefault guard (regex) ---

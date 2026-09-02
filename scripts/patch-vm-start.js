@@ -2,9 +2,10 @@
 /**
  * Dynamic VM Start Intercept Patch
  *
- * Discovers the VM start function by its semantic signature (the [VM:start]
- * log string and 4-param async function pattern), then injects a Linux
- * bubblewrap session block before the original function body.
+ * Discovers the VM start function by its semantic signature (the
+ * "[VM:start] Beginning startup" log string and its enclosing async function
+ * declaration), then injects a Linux bubblewrap session block before the
+ * original function body.
  *
  * Version-resilient — discovers identifiers at build time, not hardcoded.
  */
@@ -43,21 +44,23 @@ console.log(`  Main-process chunk: ${path.basename(INDEX_JS_PATH)}`);
 
 let content = fs.readFileSync(INDEX_JS_PATH, 'utf8');
 
-// Discover the VM start function. It is the 4-param async function whose body
-// emits the `[VM:start]` log. Rather than pin the exact body preamble (which is
-// refactored between versions — e.g. cleanup loops were added before the
-// Date.now()/info() sequence), locate the first `[VM:start]` and scan back to the
-// nearest enclosing 4-param async declaration. We inject the Linux block right
-// after that function's opening brace, leaving the original body untouched.
-const vmStartIdx = content.indexOf('[VM:start]');
+// Discover the VM start function: the async function whose body emits the
+// "[VM:start] Beginning startup" log. Anchoring on the FIRST bare "[VM:start]"
+// broke in 1.44121.0 — the proxy/PAC egress-pinning helper now logs
+// "[VM:start] guest egress pinned to ..." and sits earlier in the chunk — so
+// anchor on the startup banner, which only the real start worker emits.
+// The arity also drifts between releases (4 params through 1.30096.1, 3 in
+// 1.44121.0 after the abort controller moved into the wrapper), so accept any
+// non-empty parameter list and rely on the proximity sanity check below.
+const vmStartIdx = content.indexOf('[VM:start] Beginning startup');
 if (vmStartIdx === -1) {
-  console.error('  ERROR: Could not find [VM:start] log string');
+  console.error('  ERROR: Could not find "[VM:start] Beginning startup" log string');
   process.exit(1);
 }
 
 // The minifier's identifier alphabet includes `$`, so identifier classes must be
 // [\w$], not \w.
-const declRe = /async function ([\w$]+)\(([\w$]+),([\w$]+),([\w$]+),([\w$]+)\)\{/g;
+const declRe = /async function ([\w$]+)\(([\w$]+(?:,[\w$]+)*)\)\{/g;
 let m, decl = null;
 while ((m = declRe.exec(content)) !== null) {
   if (m.index >= vmStartIdx) break;
@@ -65,7 +68,7 @@ while ((m = declRe.exec(content)) !== null) {
 }
 
 if (!decl) {
-  console.error('  ERROR: Could not find a 4-param async function before [VM:start]');
+  console.error('  ERROR: Could not find an async function before the startup banner');
   process.exit(1);
 }
 
@@ -73,14 +76,14 @@ if (!decl) {
 // no other function may open between it and the [VM:start] log.
 const bodyHead = content.slice(decl.index + decl[0].length, vmStartIdx);
 if (bodyHead.includes('async function ') || (vmStartIdx - decl.index) > 4000) {
-  console.error('  ERROR: Nearest 4-param async decl is not the [VM:start] encloser');
+  console.error('  ERROR: Nearest async decl is not the [VM:start] startup encloser');
   console.error(`         (name=${decl[1]}, distance=${vmStartIdx - decl.index})`);
   process.exit(1);
 }
 
 const funcName = decl[1];
-const params = [decl[2], decl[3], decl[4], decl[5]];
-const declStr = decl[0]; // e.g. async function ZBr(A,e,t,i){
+const params = decl[2].split(',');
+const declStr = decl[0]; // e.g. async function xjn(e,t,r){
 
 console.log(`  Found VM start function: ${funcName}(${params.join(',')})`);
 
