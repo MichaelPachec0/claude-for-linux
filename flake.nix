@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "1.44121.0";
-      claudeDmgHash = "sha256-4hzTf/KRiAN3BU5SR4oOGrOYLpmjr71V7fIdzeF+Uwc=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-a670de389e37e5e93692c0aedf350fe0d2cde4c1.dmg";
+      claudeVersion = "1.46388.4";
+      claudeDmgHash = "sha256-xUUduiG4v0Iy+P7/v/lG3Hvk1qZO4i0xkJVOFvYkRMk=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-50e62f90a2c85243eef42913398f7c8f1534abef.dmg";
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
 
@@ -250,15 +250,18 @@
               # — a unique, stable signature. The old anchor was "any two-arg async function
               # within 200 chars of a [downloadVM] log string", which also matched the unrelated
               # stale-cache sweeper in the same chunk.
-              # 1.44121.0: the body now opens with an awaited feature-gate fetch
+              # 1.44121.0: the body opened with an awaited feature-gate fetch
               # (`async function sU(e,t){await Lz();let{yukonSilver:r}=zz();...`), so the
-              # anchor allows one optional `await X();` statement before the destructure.
-              # The other yukonSilver destructures in the bundle keep different arities or
-              # preambles (3-arg warm-downloader, Date.now() in the startVM wrapper), so the
-              # match stays unique.
+              # anchor allowed one optional `await X();` statement before the destructure.
+              # 1.46388.4: the destructure is gone entirely — the capability read collapsed
+              # into a direct status probe inside the return expression:
+              #   async function GU(e,t){return await _B(),yB().status==="supported"&&(...)}
+              # Anchor on that opening (`{return await X(),Y().status===`supported`&&`),
+              # which only the downloader has (the exports map names it downloadVM). The
+              # injected Linux early-return still lands before the probe runs.
               echo "[patch:04] Patching download skip..."
               patch_js 04 \
-                's{(async function [\w\$]+\([\w\$]+,[\w\$]+\)\{(?:await [\w\$]+\(\);)?)(let\{yukonSilver:)}{$1if(process.platform==="linux"&&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' \
+                's{(async function [\w\$]+\([\w\$]+,[\w\$]+\)\{)(return await [\w\$]+\(\),[\w\$]+\(\)\.status===["\x60]supported["\x60]&&)}{$1if(process.platform==="linux"&&global.__linuxCowork){console.log("[Cowork Linux] Skipping bundle download");return!1}$2}g' \
                 'if\(process\.platform==="linux"&&global\.__linuxCowork\)\{console\.log\("\[Cowork Linux\] Skipping bundle download"\)'
               echo "[patch:04] Done"
 
@@ -506,10 +509,15 @@
               # crashes at startup. Gate it behind a darwin check (`&&` short-circuits on Linux,
               # leaving the trailing comma-sequence — e.g. ...,GCo() — to run untouched). The
               # other systemPreferences.* calls are already darwin-gated or runtime/try-catch'd.
-              echo "[patch:13] Patching systemPreferences.setUserDefault guard..."
+              # 1.46388.4: the same top-level init grew a third macOS-only call in the same
+              # comma-sequence, `systemPreferences.registerDefaults({NSMenuEnableActionImages:!1})`,
+              # which is likewise undefined on Linux and crashed module load with
+              # "registerDefaults is not a function". Guard it the same way; the method
+              # alternation keeps this one patch owning the whole user-defaults family.
+              echo "[patch:13] Patching systemPreferences setUserDefault/registerDefaults guards..."
               patch_js 13 \
-                's{([\w\$]+)\.systemPreferences\.setUserDefault\(}{process.platform==="darwin"&&$1.systemPreferences.setUserDefault(}g' \
-                'process\.platform==="darwin"&&[\w$]+\.systemPreferences\.setUserDefault\('
+                's{([\w\$]+)\.systemPreferences\.(setUserDefault|registerDefaults)\(}{process.platform==="darwin"&&$1.systemPreferences.$2(}g' \
+                'process\.platform==="darwin"&&[\w$]+\.systemPreferences\.registerDefaults\('
               echo "[patch:13] Done"
 
               # --- Patch 14: macOS-only app.configureWebAuthn guard (regex) ---
