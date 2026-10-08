@@ -87,25 +87,34 @@ const declStr = decl[0]; // e.g. async function xjn(e,t,r){
 
 console.log(`  Found VM start function: ${funcName}(${params.join(',')})`);
 
-// Discover the status dispatch: the readiness notifier called immediately before
-// the `lam_vm_startup_completed` analytics event (historically `WORD(WORD.Ready)`,
-// now a zero-arg notifier such as `orA()`). Best-effort; falls back to a log.
-// As of 1.28929.0 the minifier emits backtick string literals and the analytics
-// emitter is a member call (`Ze(),i.B(`lam_vm_startup_completed`,...)`), so both
-// patterns accept either quote style and an optional `.member` on the emitter.
+// Discover the status dispatch: the running-status notifier that tells the
+// renderer the VM is Ready. Best-effort; falls back to a log.
+//
+// Primary anchor is the notifier's own definition, keyed on the eIPC method name
+// `dispatchRunningStatusChanged` (a property name, so the minifier keeps it):
+//   function zJ(e){(e===yv.Booting||e===yv.Ready)&&(LJ=null),...
+//     ?.dispatchRunningStatusChanged(e)}
+// This yields `zJ(yv.Ready)`. Do not confuse it with the download-status
+// notifier (`kzr(vv.Ready)` -> dispatchDownloadStatusChange), a lookalike.
+//
+// Legacy anchor: `X(Y.Ready)` immediately before the `lam_vm_startup_completed`
+// analytics event. As of 2.26454.0 that slot holds unrelated zero-arg calls
+// (`SBr(),Nzr(),Gk(...)`: an e2e smoke hook and a network-timer clear), so a
+// bare "any call before the event" fallback is NOT used: it silently picked
+// `Nzr()` and made this dispatch a no-op.
 let statusDispatch = 'console.log("[Cowork Linux] Ready")';
+const notifierMatch = content.match(
+  /function ([\w$]+)\(([\w$]+)\)\{[^{}]*?\2===([\w$]+)\.Ready[^{}]*?\.dispatchRunningStatusChanged\(\2\)\}/
+);
 const readyArgMatch = content.match(
   /([\w$]+)\(([\w$]+)\.Ready\),[\w$.]+\(["`]lam_vm_startup_completed["`]/
 );
-const readyCallMatch = content.match(
-  /([\w$]+\(\)),[\w$.]+\(["`]lam_vm_startup_completed["`]/
-);
-if (readyArgMatch) {
+if (notifierMatch) {
+  statusDispatch = `${notifierMatch[1]}(${notifierMatch[3]}.Ready)`;
+  console.log(`  Found status dispatch: ${statusDispatch}`);
+} else if (readyArgMatch) {
   statusDispatch = `${readyArgMatch[1]}(${readyArgMatch[2]}.Ready)`;
-  console.log(`  Found status dispatch: ${statusDispatch}`);
-} else if (readyCallMatch) {
-  statusDispatch = readyCallMatch[1];
-  console.log(`  Found status dispatch: ${statusDispatch}`);
+  console.log(`  Found status dispatch (legacy): ${statusDispatch}`);
 } else {
   console.log('  WARNING: Could not find status dispatch, using console.log fallback');
 }
