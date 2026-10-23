@@ -694,7 +694,7 @@
             nativeBuildInputs = [ pkgs.makeWrapper ];
             postBuild = ''
               mkdir -p $out/bin
-              makeWrapper ${pkgs.electron}/bin/electron $out/bin/claude-desktop \
+              makeWrapper ${pkgs.electron_44}/bin/electron $out/bin/claude-desktop \
                 --add-flags "$out/lib/claude-desktop/app.asar" \
                 --add-flags "--no-sandbox" \
                 --add-flags "--ozone-platform-hint=auto" \
@@ -945,7 +945,7 @@
               nodejs
               python3
               bubblewrap
-              electron_41
+              electron_44
               _7zz
 
               # Development tools
