@@ -173,10 +173,14 @@ const injection = `${declStr}
         spawn:(id,name,command,args,cwd,env,additionalMounts,isResume,allowedDomains,oneShot,mountSkeletonHome,oauthToken)=>{
           const resolved=__resolveCommand(command||"claude");
           const procEnv=Object.assign({},process.env,env||{});
+          // The host HOME leaks in via process.env; unless the caller set HOME
+          // itself, drop it so the sandbox defaults HOME to the guest home
+          // (/sessions/<name>), matching the VM user the app expects.
+          if(!(env&&env.HOME))delete procEnv.HOME;
           if(oauthToken)procEnv.CLAUDE_CODE_OAUTH_TOKEN=oauthToken;
           // Secret-safe spawn log: env KEYS and mount points only, never values/tokens.
           console.log("[Cowork Linux] spawn "+JSON.stringify({id:id,name:name,command:command,resolved:resolved,args:args||[],cwd:cwd||null,oneShot:!!oneShot,hasOauthToken:!!oauthToken,envKeys:Object.keys(env||{}),mounts:additionalMounts?Object.keys(additionalMounts):[]}));
-          const procInfo=manager.spawnSandboxed(sessionId,resolved,args||[],{cwd:cwd||void 0,env:procEnv,additionalMounts:additionalMounts||void 0,stdio:["pipe","pipe","pipe"]});
+          const procInfo=manager.spawnSandboxed(sessionId,resolved,args||[],{cwd:cwd||void 0,env:procEnv,additionalMounts:additionalMounts||void 0,vmProcessName:name||void 0,stdio:["pipe","pipe","pipe"]});
           const child=procInfo.child;
           const rec={id,proc:procInfo,running:true,exitCode:void 0};
           __procs.set(id,rec);

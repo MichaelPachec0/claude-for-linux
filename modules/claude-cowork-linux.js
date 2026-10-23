@@ -247,22 +247,46 @@ class CoworkSessionManager {
       bwrapArgs.push('--bind', mount.hostPath, `${mntRoot}/${mount.name}`);
     }
 
-    // Writable per-session HOME — the agent writes its config/state here. Callers
-    // point HOME at SANDBOX_HOME via env (and CLAUDE_CONFIG_DIR underneath it).
-    const sandboxHome = '/home/cowork';
-    const homeHostDir = path.join(session.dir, 'home');
+    // Writable HOME — the agent writes its config/state here.
+    //
+    // Upstream's VM guest runs each spawn as user <vmProcessName> (e.g.
+    // rcw-01jw...) with HOME=/sessions/<vmProcessName>, sets cwd to that HOME,
+    // and expects every additionalMounts key at ~/mnt/<key> (the agent's own
+    // commands say `cd ~/mnt/<folder>`; upstream rejects any guest path outside
+    // /sessions/<vmProcessName>/). Mirror that layout when the caller passes the
+    // spawn name; otherwise fall back to a generic per-session /home/cowork.
+    const vmProcessName = typeof options.vmProcessName === 'string' &&
+      /^[A-Za-z0-9._-]+$/.test(options.vmProcessName) &&
+      options.vmProcessName !== '.' && options.vmProcessName !== '..'
+      ? options.vmProcessName : null;
+    const sandboxHome = vmProcessName ? `/sessions/${vmProcessName}` : '/home/cowork';
+    const homeHostDir = vmProcessName
+      ? path.join(session.dir, 'guests', vmProcessName)
+      : path.join(session.dir, 'home');
     if (!fs.existsSync(homeHostDir)) fs.mkdirSync(homeHostDir, { recursive: true, mode: 0o700 });
     bwrapArgs.push('--bind', homeHostDir, sandboxHome);
 
     // Additional mounts requested by the caller: { guestPath: { path, mode } }.
     // mode containing 'w' or 'd' => writable bind, else read-only. A relative
-    // guestPath is resolved under the sandbox HOME.
+    // guestPath is resolved under ~/mnt for a named VM process (upstream's
+    // layout), else under the sandbox HOME. Relative keys may not escape that root.
+    const relMountRoot = vmProcessName ? path.posix.join(sandboxHome, 'mnt') : sandboxHome;
     if (options.additionalMounts && typeof options.additionalMounts === 'object') {
       for (const [guestPath, spec] of Object.entries(options.additionalMounts)) {
-        if (!spec || !spec.path || !fs.existsSync(spec.path)) continue;
-        const target = path.isAbsolute(guestPath) ? guestPath : path.posix.join(sandboxHome, guestPath);
+        if (!spec || typeof spec.path !== 'string' || !spec.path) continue;
+        // Upstream encodes host paths relative to "/" (the macOS VM shares the
+        // host root), e.g. "home/me/proj"; resolve them back to absolute.
+        const hostPath = path.resolve('/', spec.path);
+        if (!fs.existsSync(hostPath)) {
+          console.log('[Cowork Linux] skip mount ' + JSON.stringify({ guestPath, hostPath }) + ': host path missing');
+          continue;
+        }
+        const target = path.posix.isAbsolute(guestPath)
+          ? path.posix.normalize(guestPath)
+          : path.posix.join(relMountRoot, guestPath);
+        if (!path.posix.isAbsolute(guestPath) && !target.startsWith(relMountRoot + '/')) continue;
         const writable = typeof spec.mode === 'string' && /[wd]/.test(spec.mode);
-        bwrapArgs.push(writable ? '--bind' : '--ro-bind', spec.path, target);
+        bwrapArgs.push(writable ? '--bind' : '--ro-bind', hostPath, target);
       }
     }
 
