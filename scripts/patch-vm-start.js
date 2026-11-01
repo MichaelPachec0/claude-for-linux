@@ -172,11 +172,10 @@ const injection = `${declStr}
         // id,name,command,args,cwd,env,additionalMounts,isResume,allowedDomains,oneShot,mountSkeletonHome,oauthToken
         spawn:(id,name,command,args,cwd,env,additionalMounts,isResume,allowedDomains,oneShot,mountSkeletonHome,oauthToken)=>{
           const resolved=__resolveCommand(command||"claude");
-          const procEnv=Object.assign({},process.env,env||{});
-          // The host HOME leaks in via process.env; unless the caller set HOME
-          // itself, drop it so the sandbox defaults HOME to the guest home
-          // (/sessions/<name>), matching the VM user the app expects.
-          if(!(env&&env.HOME))delete procEnv.HOME;
+          // Pass only upstream's env additions (what the VM guest would receive),
+          // never the host Electron env: spawnSandboxed builds the guest-like base
+          // (PATH, HOME=/sessions/<name>, USER, LANG) from an allowlist.
+          const procEnv=Object.assign({},env||{});
           if(oauthToken)procEnv.CLAUDE_CODE_OAUTH_TOKEN=oauthToken;
           // Secret-safe spawn log: env KEYS and mount points only, never values/tokens.
           console.log("[Cowork Linux] spawn "+JSON.stringify({id:id,name:name,command:command,resolved:resolved,args:args||[],cwd:cwd||null,oneShot:!!oneShot,hasOauthToken:!!oauthToken,envKeys:Object.keys(env||{}),mounts:additionalMounts?Object.keys(additionalMounts):[]}));
