@@ -27,6 +27,48 @@ function findBwrap() {
 }
 const BWRAP_PATH = findBwrap();
 
+// Sandbox environment.
+//
+// Upstream's Cowork code targets a macOS-hosted Linux VM: it spawns bare
+// command names ("bash", "claude") and sends only env *additions* (TZ,
+// GIT_CONFIG_*, an OAuth token), relying on the guest image for PATH, HOME and
+// USER. Inheriting the host Electron env instead breaks that (the host PATH
+// names /run/current-system/sw/bin, ~/.nix-profile/bin, ... which are not bound
+// in the sandbox, so `bwrap: execvp bash: No such file or directory`) and leaks
+// host-only state (D-Bus/Wayland/ssh-agent sockets, LD_LIBRARY_PATH) into it.
+// Build a guest-like base env from an allowlist instead.
+const GUEST_PATH = '/usr/local/bin:/usr/bin:/bin';
+// Host variables a guest process may still inherit: network proxy settings
+// (the network namespace is shared) and the timezone.
+const HOST_ENV_PASSTHROUGH = [
+  'TZ',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
+  'http_proxy', 'https_proxy', 'no_proxy', 'all_proxy',
+];
+
+function buildSandboxEnv({ home, user, callerEnv, hostEnv = process.env }) {
+  // COWORK_SANDBOX_PATH: Nix-built toolset (bash, coreutils, git, python3, node,
+  // ...) under /nix/store, set by the wrapper. It goes first on PATH so bare
+  // commands resolve the same in the FHS and non-FHS builds.
+  const toolsBin = hostEnv.COWORK_SANDBOX_PATH && path.isAbsolute(hostEnv.COWORK_SANDBOX_PATH)
+    ? hostEnv.COWORK_SANDBOX_PATH : null;
+  const env = {
+    HOME: home,
+    USER: user,
+    LOGNAME: user,
+    LANG: 'C.UTF-8',
+    TMPDIR: '/tmp',
+    SHELL: toolsBin ? path.join(toolsBin, 'bash') : '/bin/sh',
+  };
+  for (const k of HOST_ENV_PASSTHROUGH) {
+    if (hostEnv[k]) env[k] = hostEnv[k];
+  }
+  Object.assign(env, callerEnv || {});
+  const basePath = (callerEnv && callerEnv.PATH) || GUEST_PATH;
+  env.PATH = toolsBin ? `${toolsBin}:${basePath}` : basePath;
+  return env;
+}
+
 /**
  * Session Manager - Tracks active Cowork sessions
  */
@@ -321,10 +363,15 @@ class CoworkSessionManager {
       console.log('[Cowork Linux] bwrap ' + bwrapArgs.join(' '));
     }
 
-    // Spawn the sandboxed process. Default HOME to the writable sandbox home so
-    // the agent doesn't try to write to a non-existent host home path.
-    const childEnv = { ...(options.env || process.env) };
-    if (!childEnv.HOME) childEnv.HOME = sandboxHome;
+    // Spawn the sandboxed process with a guest-like env (see buildSandboxEnv):
+    // options.env carries only the caller's additions, never the host env.
+    // bwrap has no --clearenv here, so this env is both what bwrap's own execvp
+    // searches for `command` and what the sandboxed process sees.
+    const childEnv = buildSandboxEnv({
+      home: sandboxHome,
+      user: vmProcessName || 'cowork',
+      callerEnv: options.env,
+    });
     const child = spawn(BWRAP_PATH, bwrapArgs, {
       stdio: options.stdio || 'pipe',
       env: childEnv,
@@ -464,4 +511,5 @@ module.exports = {
   CoworkSessionManager,
   VMCompatibilityAdapter,
   COWORK_BASE_DIR,
+  buildSandboxEnv,
 };

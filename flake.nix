@@ -682,6 +682,29 @@
             '';
           };
 
+          # Toolset for the Cowork bubblewrap sandbox: what upstream's macOS-hosted
+          # VM guest image provides on its PATH (bare `bash`, coreutils, git,
+          # python3 + pip, node, curl, ...). Upstream sends only env additions and
+          # spawns bare command names, so the sandbox needs a PATH of its own; the
+          # module puts COWORK_SANDBOX_PATH first. Everything lives in /nix/store,
+          # which the sandbox already binds read-only, so this adds no bind mounts.
+          # LibreOffice (`soffice`, used by the docx/pptx/xlsx skills) is
+          # deliberately left out for now: it is large.
+          coworkSandboxTools = pkgs.buildEnv {
+            name = "cowork-sandbox-tools";
+            paths = with pkgs; [
+              bashInteractive coreutils findutils gnugrep gnused gawk diffutils
+              gnutar gzip xz bzip2 zip unzip which file procps less
+              git curl wget jq nodejs
+              (python3.withPackages (ps: with ps; [
+                pip setuptools wheel
+                numpy pandas matplotlib pillow requests
+                openpyxl python-docx python-pptx pypdf
+              ]))
+            ];
+            pathsToLink = [ "/bin" ];
+          };
+
           # Foreground Electron wrapper (direct electron). This holds the
           # controlling terminal until the app exits — correct for running
           # *inside* a sandbox/init (the FHS runScript) but not what you want
@@ -704,6 +727,7 @@
                 --prefix LD_LIBRARY_PATH : ${pkgs.lib.makeLibraryPath [ pkgs.libsecret ]} \
                 --set BWRAP_PATH "${pkgs.bubblewrap}/bin/bwrap" \
                 --set COWORK_SANDBOX_GLIBC "${pkgs.glibc}/lib" \
+                --set COWORK_SANDBOX_PATH "${coworkSandboxTools}/bin" \
                 --set CHROME_DESKTOP "com.anthropic.Claude.desktop" \
                 --prefix XDG_DATA_DIRS : "$out/share"
             '';
@@ -832,8 +856,25 @@
           claude-desktop-fhs = claudeDesktopFHS;
           claude-app = claudeApp;
           asar-tool = asarTool;
+          cowork-sandbox-tools = coworkSandboxTools;
         }
       );
+
+      # `nix flake check` runs the Cowork sandbox env tests. The bwrap integration
+      # test skips inside the Nix build sandbox (no nested user namespaces); run
+      # it on the host with:
+      #   COWORK_SANDBOX_PATH=$(nix build .#cowork-sandbox-tools --print-out-paths)/bin \
+      #     node --test tests/cowork-sandbox-env.test.js
+      checks = forEachSystem (system:
+        let pkgs = nixpkgs.legacyPackages.${system}; in {
+          cowork-sandbox-env = pkgs.runCommand "cowork-sandbox-env-test" {
+            nativeBuildInputs = [ pkgs.nodejs ];
+          } ''
+            COWORK_MODULE=${./modules/claude-cowork-linux.js} BWRAP_PATH=/nonexistent \
+              node --test ${./tests/cowork-sandbox-env.test.js}
+            touch $out
+          '';
+        });
 
       apps = forEachSystem (system: {
         default = {
