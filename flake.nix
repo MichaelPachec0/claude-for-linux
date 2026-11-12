@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "4.4212.0";
-      claudeDmgHash = "sha256-LV7GFkhh/gVsfwqysY49bYF/gssXs+GcOuYSM/Z0npM=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-cbfe3c56d49c49332ad5a9588303c9dbc70a5e7f.dmg";
+      claudeVersion = "4.23118.1";
+      claudeDmgHash = "sha256-atmmeP8Zf+bVqeiXO7CLt1SM1AwmxMx0ftLKkr5qFSQ=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-e071e72f72fe1f56124e3c8a0096f4d75510060a.dmg";
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
 
@@ -120,6 +120,21 @@
                 fi
               done
               echo "  Copied $(ls extracted/resources/TrayIcon* extracted/resources/EchoTray* extracted/resources/Tray-Win32* 2>/dev/null | wc -l) tray icons"
+
+              # The macOS DMG only ships TrayIconTemplate*.png; the TrayIconLinux{,-Dark}.png
+              # names patch 08b selects exist only in upstream's Linux build. Without them
+              # nativeImage.createFromPath returns an empty image and the panel shows a
+              # placeholder icon. Derive both from the template (light-panel glyph as-is,
+              # dark-panel glyph = inverted RGB, alpha preserved).
+              echo "  Generating Linux tray icons from template..."
+              if [ -f extracted/resources/TrayIconTemplate.png ]; then
+                ${pkgs.python3}/bin/python3 ${./tools/tray_icons.py} \
+                  extracted/resources/TrayIconTemplate.png extracted/resources
+              fi
+              for icon in TrayIconLinux.png TrayIconLinux-Dark.png; do
+                [ -s "extracted/resources/$icon" ] \
+                  || { echo "ERROR: $icon could not be generated (tray would render a placeholder)"; exit 1; }
+              done
 
               # Extract app icon from ICNS for notification icon and desktop entry
               echo "  Extracting app icons from ICNS..."
@@ -366,6 +381,24 @@
                 's{(async function [\w\$]+\(\)\{return )process\.platform===["\x60]darwin["\x60](\?await [\w\$]+\(\):null\})}{$1(process.platform==="darwin"||process.platform==="linux")$2}g' \
                 '\(process\.platform==="darwin"\|\|process\.platform==="linux"\)\?await [\w$]+\(\):null'
               echo "[patch:06b] Done"
+
+              # --- Patch 21: Skip the macOS-only Swift addon on Linux (regex) ---
+              # @ant/claude-swift's JS wrapper does not throw on non-darwin; it ends with
+              #   if(process.platform==="darwin") module.exports = new SwiftAddon();
+              #   else module.exports = {};
+              # The VM module loader (the `return <a>||<b>||(<log>["[VM] Loading %s
+              # module..."], <promise>)` function) still imports it, gets `{}`, and then
+              # wraps `t.vm` (undefined) in the Proxy helper:
+              #   [VM] Failed to load module: TypeError: Cannot create proxy with a
+              #   non-object as target or handler
+              # which also fires a Sentry event on every launch. The Swift image can never be
+              # used on Linux (bubblewrap supplies the VM via patch 05), so short-circuit the
+              # loader before the import. pP() (patch 06a) still returns the Linux instance.
+              echo "[patch:21] Short-circuiting @ant/claude-swift loader on Linux..."
+              patch_js 21 \
+                's{(async function [\w\$]+\(\)\{)(return [\w\$]+\|\|[\w\$]+\|\|\([\w\$]+\.info\("\[VM\] Loading %s module\.\.\.","\@ant\/claude-swift"\),)}{$1if(process.platform==="linux")return null;$2}g' \
+                'async function [\w$]+\(\)\{if\(process\.platform==="linux"\)return null;return [\w$]+\|\|[\w$]+\|\|\('
+              echo "[patch:21] Done"
 
               # --- Patch 07: Platform branding ---
               echo "[patch:07] Injecting platform branding fix..."
@@ -658,8 +691,9 @@
               # COSMIC's SNI can't read from inside ASAR archives, so these must
               # be on the real filesystem for the tray icon to display correctly.
               mkdir -p $out/lib/claude-desktop/resources
-              # TrayIconLinux{,-Dark}.png are what patch 08b selects on Linux (upstream
-              # added them in 1.30096.1); without them here the tray renders blank.
+              # TrayIconLinux{,-Dark}.png are what patch 08b selects on Linux; they are
+              # generated from TrayIconTemplate.png above because the macOS DMG does not
+              # ship the Linux art. Without them the tray renders a placeholder.
               for icon in extracted/resources/TrayIconTemplate*.png extracted/resources/TrayIconLinux*.png extracted/resources/icon.png; do
                 if [ -f "$icon" ]; then
                   cp "$icon" $out/lib/claude-desktop/resources/
