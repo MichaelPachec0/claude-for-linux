@@ -1,0 +1,253 @@
+name: Auto-update Claude Desktop deb
+
+# Tracks Anthropic's apt repo for the official Linux build (claude-deb-fhs package in
+# flake.nix). The repo's Packages index is the source of truth: it carries the
+# version, the pool path and the SHA256 of every .deb, so no prefetch is needed —
+# the hash is converted to SRI and written straight into flake.nix.
+#
+# Mirrors auto-update-dmg.yml: same PR flow, same verified-build comment.
+
+on:
+  schedule:
+    # Run daily at 06:30 UTC (offset from the DMG job so the two don't race)
+    - cron: "30 6 * * *"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Force update even if version matches"
+        required: false
+        default: "false"
+        type: boolean
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+    outputs:
+      update_available: ${{ steps.check.outputs.update_available }}
+      current_version: ${{ steps.check.outputs.current_version }}
+      latest_version: ${{ steps.check.outputs.latest_version }}
+      amd64_url: ${{ steps.check.outputs.amd64_url }}
+      amd64_sha256: ${{ steps.check.outputs.amd64_sha256 }}
+      arm64_url: ${{ steps.check.outputs.arm64_url }}
+      arm64_sha256: ${{ steps.check.outputs.arm64_sha256 }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check for update
+        id: check
+        run: |
+          current_version=$(grep -oP 'claudeDebVersion = "\K[^"]+' flake.nix)
+          echo "current_version=$current_version" >> "$GITHUB_OUTPUT"
+          echo "Current version: $current_version"
+
+          base="https://downloads.claude.ai/claude-desktop/apt/stable"
+
+          # Highest Version stanza for one arch, as "<version> <pool path> <sha256>".
+          # The index is not guaranteed to be sorted, so compare with `sort -V`.
+          latest_for() {
+            arch="$1"
+            curl -sf --max-time 60 "$base/dists/stable/main/binary-$arch/Packages" \
+              -o "Packages-$arch" || return 1
+            awk 'BEGIN { RS=""; FS="\n" }
+                 /^Package: claude-desktop$/ {
+                   v=""; f=""; s="";
+                   for (i = 1; i <= NF; i++) {
+                     if ($i ~ /^Version: /)  v = substr($i, 10);
+                     if ($i ~ /^Filename: /) f = substr($i, 11);
+                     if ($i ~ /^SHA256: /)   s = substr($i, 9);
+                   }
+                   if (v != "" && f != "" && s != "") print v, f, s;
+                 }' "Packages-$arch" | sort -V -k1,1 | tail -1
+          }
+
+          amd64=$(latest_for amd64) || true
+          if [ -z "$amd64" ]; then
+            echo "::error::Could not read the amd64 Packages index"
+            exit 1
+          fi
+          read -r latest_version amd64_path amd64_sha256 <<< "$amd64"
+
+          arm64=$(latest_for arm64) || true
+          if [ -z "$arm64" ]; then
+            echo "::error::Could not read the arm64 Packages index"
+            exit 1
+          fi
+          read -r arm64_version arm64_path arm64_sha256 <<< "$arm64"
+
+          # flake.nix pins ONE version for both arches (the URL template takes the
+          # arch only), so a lagging arm64 publication cannot be expressed — stop
+          # and let a human decide rather than writing a URL that 404s.
+          if [ "$arm64_version" != "$latest_version" ]; then
+            echo "::error::arm64 is at $arm64_version but amd64 is at $latest_version; refusing to bump"
+            exit 1
+          fi
+
+          echo "latest_version=$latest_version" >> "$GITHUB_OUTPUT"
+          echo "amd64_url=$base/$amd64_path" >> "$GITHUB_OUTPUT"
+          echo "amd64_sha256=$amd64_sha256" >> "$GITHUB_OUTPUT"
+          echo "arm64_url=$base/$arm64_path" >> "$GITHUB_OUTPUT"
+          echo "arm64_sha256=$arm64_sha256" >> "$GITHUB_OUTPUT"
+          echo "Latest version: $latest_version"
+          echo "  amd64: $base/$amd64_path"
+          echo "  arm64: $base/$arm64_path"
+
+          if [ "$current_version" = "$latest_version" ] && [ "${{ inputs.force }}" != "true" ]; then
+            echo "Already up-to-date"
+            echo "update_available=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Update available: $current_version -> $latest_version"
+            echo "update_available=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  update-flake:
+    needs: check-update
+    if: needs.check-update.outputs.update_available == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      pr_number: ${{ steps.create-pr.outputs.pull-request-number }}
+      pr_branch: ${{ steps.create-pr.outputs.pull-request-branch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Update flake.nix
+        env:
+          LATEST_VERSION: ${{ needs.check-update.outputs.latest_version }}
+          AMD64_SHA256: ${{ needs.check-update.outputs.amd64_sha256 }}
+          ARM64_SHA256: ${{ needs.check-update.outputs.arm64_sha256 }}
+        run: |
+          # apt publishes hex digests; fetchurl pins SRI.
+          amd64_sri=$(nix hash convert --hash-algo sha256 --to sri "$AMD64_SHA256")
+          arm64_sri=$(nix hash convert --hash-algo sha256 --to sri "$ARM64_SHA256")
+
+          # Restrict the hash edits to the claudeDebHashes attrset so the DMG hashes
+          # above it are untouched.
+          sed -i \
+            -e "s|claudeDebVersion = \"[^\"]*\"|claudeDebVersion = \"$LATEST_VERSION\"|" \
+            -e "/claudeDebHashes = {/,/};/ s|x86_64-linux = \"[^\"]*\"|x86_64-linux = \"$amd64_sri\"|" \
+            -e "/claudeDebHashes = {/,/};/ s|aarch64-linux = \"[^\"]*\"|aarch64-linux = \"$arm64_sri\"|" \
+            flake.nix
+
+          echo "Updated flake.nix:"
+          grep -A4 -E 'claudeDeb(Version|Hashes)' flake.nix
+
+          # A silent sed no-op would produce a PR that changes nothing.
+          grep -qF "claudeDebVersion = \"$LATEST_VERSION\"" flake.nix \
+            || { echo "::error::version bump did not apply"; exit 1; }
+          grep -qF "$amd64_sri" flake.nix || { echo "::error::amd64 hash bump did not apply"; exit 1; }
+          grep -qF "$arm64_sri" flake.nix || { echo "::error::arm64 hash bump did not apply"; exit 1; }
+
+      - name: Create Pull Request
+        id: create-pr
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Update Claude Desktop deb to v${{ needs.check-update.outputs.latest_version }}"
+          title: "Update Claude Desktop (Linux deb) to v${{ needs.check-update.outputs.latest_version }}"
+          body: |
+            Automated update detected a new official Linux release in Anthropic's apt repo.
+
+            | Field | Value |
+            |-------|-------|
+            | **Old version** | `${{ needs.check-update.outputs.current_version }}` |
+            | **New version** | `${{ needs.check-update.outputs.latest_version }}` |
+            | **amd64 .deb** | `${{ needs.check-update.outputs.amd64_url }}` |
+            | **arm64 .deb** | `${{ needs.check-update.outputs.arm64_url }}` |
+
+            The hashes are the apt index's own SHA256 digests, converted to SRI.
+
+            Build verification is running — see the `verify-build` job.
+
+            ---
+            *Created automatically by the auto-update workflow.*
+          branch: auto-update/claude-deb-fhs-v${{ needs.check-update.outputs.latest_version }}
+          delete-branch: true
+          labels: |
+            automated
+            update
+
+  verify-build:
+    needs: [check-update, update-flake]
+    if: needs.update-flake.outputs.pr_number != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.update-flake.outputs.pr_branch }}
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Build
+        id: build
+        continue-on-error: true
+        run: |
+          # `set -o pipefail` is load-bearing: GitHub's default `bash -e {0}` has no
+          # pipefail, so `nix build ... | tee` would exit with tee's status (0) no
+          # matter how the build went. Same trap documented in auto-update-dmg.yml.
+          set -o pipefail
+          nix build .#claude-deb-fhs --print-build-logs 2>&1 | tee build-output.log
+
+      - name: Comment on PR (build succeeded)
+        if: steps.build.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.update-flake.outputs.pr_number }}
+        run: |
+          cat > comment-body.md <<'COMMENT'
+          Build verified — `nix build .#claude-deb-fhs` succeeded with the new .deb.
+
+          - [x] `.deb` fetched and its hash matches the apt index
+          - [x] FHS root assembles (Electron + Cowork VM tooling)
+          - [ ] Application launches correctly (manual check)
+          COMMENT
+          gh pr comment "$PR_NUMBER" --body-file comment-body.md
+
+      - name: Comment on PR (build failed)
+        if: steps.build.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.update-flake.outputs.pr_number }}
+          OLD_VERSION: ${{ needs.check-update.outputs.current_version }}
+          NEW_VERSION: ${{ needs.check-update.outputs.latest_version }}
+        run: |
+          cat > comment-body.md <<COMMENT
+          @claude The automated bump of the Linux .deb from v${OLD_VERSION} to v${NEW_VERSION} broke the build.
+
+          ## Context
+
+          - \`claude-deb-fhs\` in \`flake.nix\` repackages Anthropic's apt \`.deb\` verbatim: \`fetchurl\` pins the per-arch SHA256 (SRI), and \`claudeDebApp\` just runs \`dpkg-deb -x\`.
+          - A hash failure means the apt index and the pool file disagree — re-read the \`Packages\` stanza for both arches.
+          - A failure in \`claudeDebFHSInner\` means the FHS root no longer assembles (missing package attribute, or a changed Electron dependency set).
+          - Cowork needs \`qemu\`, \`virtiofsd\` and OVMF firmware in the FHS root; \`claudeDebFirmware\` stages the Debian firmware names under \`/usr/share/OVMF\`.
+
+          <details>
+          <summary>Build output (last 200 lines)</summary>
+
+          \`\`\`
+          COMMENT
+          # Append build log literally (no shell interpolation)
+          tail -200 build-output.log >> comment-body.md
+          cat >> comment-body.md <<'COMMENT'
+          ```
+
+          </details>
+          COMMENT
+          gh pr comment "$PR_NUMBER" --body-file comment-body.md
+
+          # Mark PR as draft since it needs work
+          gh pr ready "$PR_NUMBER" --undo || true
