@@ -38,6 +38,7 @@ jobs:
           nix build .#claude-app         --print-build-logs
           nix build .#claude-desktop     --print-build-logs
           nix build .#claude-desktop-fhs --print-build-logs
+          nix build .#claude-deb-fhs     --print-build-logs
 
       # Defence in depth. The flake already runs `node --check` on the patched JS during
       # the build, but re-verify the packed app.asar here so a regression that weakens the

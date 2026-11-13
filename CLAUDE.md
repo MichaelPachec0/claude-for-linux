@@ -8,6 +8,9 @@ Enabling macOS-only Claude Desktop features on Linux via runtime patching.
 - **Extraction**: `7zz` (modern 7-Zip, LZFSE-aware) + `asar_tool.py` — newer DMGs are LZFSE-compressed; `dmg2img` lacks LZFSE support and silently corrupts them
 - **Runtime**: `electron_37` from nixpkgs
 - **Packaging**: Nix flake with `makeWrapper` + `buildFHSEnv`
+- **Official Linux build**: `claude-deb-fhs` repackages Anthropic's apt `.deb` verbatim (Linux
+  Electron + QEMU/KVM Cowork, no patching), with `qemu`/`virtiofsd`/OVMF in its FHS root;
+  `auto-update-deb.yml` bumps version + per-arch hashes from the apt `Packages` index
 
 ## Key Commands
 
@@ -16,10 +19,12 @@ Enabling macOS-only Claude Desktop features on Linux via runtime patching.
 nix build .                     # Default (direct electron wrapper)
 nix build .#claude-desktop-fhs  # FHS wrapper (Cowork + MCP)
 nix build .#claude-app          # Just the patched app.asar
+nix build .#claude-deb-fhs      # Official Linux build (repackaged Anthropic .deb)
 
 # Run
 nix run .
 nix run .#claude-desktop-fhs
+nix run .#claude-deb-fhs
 
 # Validate
 nix flake check

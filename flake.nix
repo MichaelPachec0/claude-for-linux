@@ -13,6 +13,16 @@
       claudeDmgHash = "sha256-atmmeP8Zf+bVqeiXO7CLt1SM1AwmxMx0ftLKkr5qFSQ=";
       claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-e071e72f72fe1f56124e3c8a0096f4d75510060a.dmg";
 
+      # Official Linux build (Anthropic apt repo). Unlike the DMG above this is a
+      # native Linux app: Linux Electron, Linux @ant/claude-native binding and the
+      # QEMU/KVM Cowork VM. Version + per-arch .deb hashes are bumped automatically
+      # by .github/workflows/auto-update-deb.yml.
+      claudeDebVersion = "5.1231.2";
+      claudeDebHashes = {
+        x86_64-linux = "sha256-600Wya/wppY2bYhyj3T6VRNr58/ePB/jWvQGK0WVW28=";
+        aarch64-linux = "sha256-16AUTmlGl15sXzOkjbCMvgi8zaBL2xnPIlSqaQvOJcE=";
+      };
+
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
 
       forEachSystem = f: builtins.listToAttrs (map (system: {
@@ -884,10 +894,124 @@
             };
           };
 
+          # --- Official Linux build (vendored .deb) ----------------------------
+          # Repackaged verbatim from Anthropic's apt repo: nothing is patched, it
+          # already ships a Linux Electron, a Linux claude-native binding and the
+          # QEMU/KVM Cowork VM. Only an FHS root is needed for its system libs.
+          debArch = if system == "aarch64-linux" then "arm64" else "amd64";
+
+          claudeDebSrc = pkgs.fetchurl {
+            url = "https://downloads.claude.ai/claude-desktop/apt/stable/pool/main/c/claude-desktop/claude-desktop_${claudeDebVersion}_${debArch}.deb";
+            hash = claudeDebHashes.${system};
+          };
+
+          claudeDebApp = pkgs.stdenvNoCC.mkDerivation {
+            pname = "claude-desktop-deb";
+            version = claudeDebVersion;
+            src = claudeDebSrc;
+            nativeBuildInputs = [ pkgs.dpkg ];
+            dontUnpack = true;
+            # The vendor's ELF binaries/libs are release-final; fixup would rewrite
+            # rpaths out from under the bundled Electron.
+            dontPatchELF = true;
+            dontStrip = true;
+            installPhase = ''
+              runHook preInstall
+              mkdir -p $out
+              # `dpkg-deb -x` would try to restore chrome-sandbox's setuid bit, which a
+              # sandboxed build user cannot do ("Cannot change mode to rwsr-xr-x").
+              # Extract the data tarball with setuid/setgid bits dropped instead; the
+              # launcher passes --no-sandbox, so that bit is never used.
+              dpkg-deb --fsys-tarfile $src \
+                | tar -x --no-same-permissions --no-same-owner -C $out
+              runHook postInstall
+            '';
+          };
+
+          # Entry point *inside* the FHS root: exec the vendor binary in place so it
+          # resolves resources/ (app.asar, cowork-linux-helper, virtiofsd, tray
+          # icons) relative to its own path.
+          claudeDebRun = pkgs.writeShellScriptBin "claude-desktop" ''
+            exec ${claudeDebApp}/usr/lib/claude-desktop/claude-desktop \
+              --no-sandbox \
+              --ozone-platform-hint=auto \
+              --password-store=gnome-libsecret \
+              "$@"
+          '';
+
+          # UEFI firmware under the Debian paths the VM helper probes. buildFHSEnv only
+          # merges targetPkgs' /share, and OVMF keeps its images under /FV, so stage the
+          # two names it looks for (4M = the q35/4 MiB build) in an FHS-shaped package.
+          claudeDebFirmware = pkgs.runCommand "claude-desktop-deb-firmware" { } ''
+            mkdir -p $out/share/OVMF
+            ln -s ${pkgs.OVMF.fd}/FV/OVMF_CODE.fd $out/share/OVMF/OVMF_CODE.fd
+            ln -s ${pkgs.OVMF.fd}/FV/OVMF_CODE.fd $out/share/OVMF/OVMF_CODE_4M.fd
+            ln -s ${pkgs.OVMF.fd}/FV/OVMF_VARS.fd $out/share/OVMF/OVMF_VARS.fd
+            ln -s ${pkgs.OVMF.fd}/FV/OVMF_VARS.fd $out/share/OVMF/OVMF_VARS_4M.fd
+          '';
+
+          claudeDebFHSInner = pkgs.buildFHSEnv {
+            # Named like the DMG FHS env so the wrapper is $out/bin/claude-desktop,
+            # which is what mkDetachingLauncher below execs.
+            name = "claude-desktop";
+            dieWithParent = false;
+            targetPkgs = pkgs: with pkgs; [
+              # The .deb's Depends, plus what Electron 45 dlopens at runtime.
+              glib gtk3 nss nspr libdrm libgbm libxkbcommon pango cairo
+              at-spi2-atk at-spi2-core libsecret libnotify libuuid
+              libxcb libXtst alsa-lib libpulseaudio cups expat dbus udev
+              libX11 libXcomposite libXdamage libXext libXfixes libXrandr
+              libayatana-appindicator mesa libglvnd pipewire git
+              xdg-utils xdg-desktop-portal xdg-desktop-portal-gtk
+              cacert
+              coreutils bash gnugrep gnused gawk findutils
+              # Only "Recommends" in the .deb, but required for Cowork: the bundled
+              # cowork-linux-helper execs qemu-system-* and virtiofsd (/usr/bin) and
+              # boots OVMF from /usr/share/OVMF.
+              qemu virtiofsd
+            ] ++ [ claudeDebFirmware ];
+            runScript = "${claudeDebRun}/bin/claude-desktop";
+            meta = with pkgs.lib; {
+              description = "Official Claude Desktop Linux build (FHS)";
+              homepage = "https://claude.ai";
+              platforms = platforms.linux;
+              mainProgram = "claude-desktop";
+            };
+          };
+
+          # Vendor hicolor icons (the .desktop entry's Icon=claude-desktop).
+          claudeDebIcons = pkgs.runCommand "claude-desktop-deb-icons" { } ''
+            mkdir -p $out/share
+            cp -a ${claudeDebApp}/usr/share/icons $out/share/
+          '';
+
+          claudeDebFHS = pkgs.symlinkJoin {
+            name = "claude-desktop-deb-fhs-${claudeDebVersion}";
+            paths = [
+              (mkDetachingLauncher "${claudeDebFHSInner}/bin/claude-desktop")
+              claudeDebIcons
+            ];
+            # The vendor entry is used as-is except for Exec: this package's bin/ is
+            # not on a GUI session's PATH, so point it at the absolute launcher.
+            postBuild = ''
+              mkdir -p $out/share/applications
+              substitute ${claudeDebApp}/usr/share/applications/com.anthropic.Claude.desktop \
+                $out/share/applications/com.anthropic.Claude.desktop \
+                --replace-fail 'Exec=claude-desktop' "Exec=$out/bin/claude-desktop"
+            '';
+            meta = with pkgs.lib; {
+              description = "Official Claude Desktop Linux build (repackaged .deb)";
+              homepage = "https://claude.ai";
+              platforms = platforms.linux;
+              mainProgram = "claude-desktop";
+            };
+          };
+
         in {
           default = claudeDesktop;
           claude-desktop = claudeDesktop;
           claude-desktop-fhs = claudeDesktopFHS;
+          claude-deb-fhs = claudeDebFHS;
           claude-app = claudeApp;
           asar-tool = asarTool;
           cowork-sandbox-tools = coworkSandboxTools;
@@ -922,6 +1046,10 @@
         claude-desktop-fhs = {
           type = "app";
           program = "${self.packages.${system}.claude-desktop-fhs}/bin/claude-desktop";
+        };
+        claude-deb-fhs = {
+          type = "app";
+          program = "${self.packages.${system}.claude-deb-fhs}/bin/claude-desktop";
         };
       });
 
