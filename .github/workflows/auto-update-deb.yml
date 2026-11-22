@@ -47,14 +47,24 @@ jobs:
 
           base="https://downloads.claude.ai/claude-desktop/apt/stable"
 
-          # Highest Version stanza for one arch, as "<version> <pool path> <sha256>".
-          # The index is not guaranteed to be sorted, so compare with `sort -V`.
+          # Highest Version stanza for one arch, stored in $latest as
+          # "<version> <pool path> <sha256>". The index is not guaranteed to be
+          # sorted, so compare with `sort -V`. Called directly (not via $(...)) so
+          # its ::error:: lines reach stdout and a fetch failure is reported
+          # separately from a parse failure.
           latest_for() {
             arch="$1"
-            curl -sf --max-time 60 "$base/dists/stable/main/binary-$arch/Packages" \
-              -o "Packages-$arch" || return 1
-            awk 'BEGIN { RS=""; FS="\n" }
-                 /^Package: claude-desktop$/ {
+            url="$base/dists/stable/main/binary-$arch/Packages"
+            if ! curl -sf --max-time 60 "$url" -o "Packages-$arch"; then
+              echo "::error::Could not download the $arch Packages index: $url"
+              return 1
+            fi
+            # Match the stanza on its first line ($1, since FS is a newline). Do
+            # NOT use /^Package: claude-desktop$/: in paragraph mode (RS="") the
+            # record is the whole multi-line stanza, so ^ and $ anchor to the
+            # stanza's start and end and the pattern never matches.
+            latest=$(awk 'BEGIN { RS=""; FS="\n" }
+                 $1 == "Package: claude-desktop" {
                    v=""; f=""; s="";
                    for (i = 1; i <= NF; i++) {
                      if ($i ~ /^Version: /)  v = substr($i, 10);
@@ -62,22 +72,18 @@ jobs:
                      if ($i ~ /^SHA256: /)   s = substr($i, 9);
                    }
                    if (v != "" && f != "" && s != "") print v, f, s;
-                 }' "Packages-$arch" | sort -V -k1,1 | tail -1
+                 }' "Packages-$arch" | sort -V -k1,1 | tail -1)
+            if [ -z "$latest" ]; then
+              echo "::error::No complete claude-desktop stanza (Version, Filename, SHA256) in the $arch Packages index: $url"
+              return 1
+            fi
           }
 
-          amd64=$(latest_for amd64) || true
-          if [ -z "$amd64" ]; then
-            echo "::error::Could not read the amd64 Packages index"
-            exit 1
-          fi
-          read -r latest_version amd64_path amd64_sha256 <<< "$amd64"
+          latest_for amd64 || exit 1
+          read -r latest_version amd64_path amd64_sha256 <<< "$latest"
 
-          arm64=$(latest_for arm64) || true
-          if [ -z "$arm64" ]; then
-            echo "::error::Could not read the arm64 Packages index"
-            exit 1
-          fi
-          read -r arm64_version arm64_path arm64_sha256 <<< "$arm64"
+          latest_for arm64 || exit 1
+          read -r arm64_version arm64_path arm64_sha256 <<< "$latest"
 
           # flake.nix pins ONE version for both arches (the URL template takes the
           # arch only), so a lagging arm64 publication cannot be expressed — stop
