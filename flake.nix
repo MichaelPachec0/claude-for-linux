@@ -309,9 +309,16 @@
               # reaches VM start (patch 05) at all.
               # Report Ready / success on Linux when the bubblewrap backend is live — there is no
               # bundle to install; the "workspace" is created per session by patch 05.
+              # 6.28899.6: getDownloadStatus became async and moved the probe ternary into a
+              # helper (`async function GBa(){if(WY())return Sl.Downloading;...}`); the eIPC
+              # method now only awaits it and retries once behind a pending-download promise:
+              #   async getDownloadStatus(){let e=await GBa();return e!==Sl.NotDownloaded||!Y2o?e:(await Y2o,GBa())}
+              # Anchor on that body and take the enum from `e!==<Enum>.NotDownloaded`. Only the
+              # eIPC method is patched, not the helper: the helper's other caller (a startup
+              # setting sync) already returns early on Linux, where no bundle file exists.
               echo "[patch:19a] Patching Cowork download status..."
               patch_js 19a \
-                's{(getDownloadStatus\(\)\{)(return [\w\$.]+\(\)\?([\w\$.]+)\.Downloading:)}{$1if(process.platform==="linux"&&global.__linuxCowork)return $3.Ready;$2}g' \
+                's{(getDownloadStatus\(\)\{)(let ([\w\$]+)=await [\w\$.]+\(\);return \3!==([\w\$.]+)\.NotDownloaded)}{$1if(process.platform==="linux"&&global.__linuxCowork)return $4.Ready;$2}g' \
                 'getDownloadStatus\(\)\{if\(process\.platform==="linux"&&global\.__linuxCowork\)return [\w$.]+\.Ready;'
               echo "[patch:19a] Done"
 
@@ -352,9 +359,19 @@
               # path builder return null on Linux. Both wrappers (and any future caller
               # that copies the null-check idiom) then take upstream's own pass-through,
               # and the macOS path stays byte-identical.
+              # 6.28899.6: the resolver wrapper no longer sits right after the path builder
+              # (`function a_t(){{...,"Helpers","disclaimer")}}var o_t=...` with
+              # `function __t(){return a_t()}` ~2 KB later), and the new index.pre.js entry
+              # carries its own copy (`function Ve(){{...}}` ... `function bA(){return Ve()}`).
+              # So capture the path builder's NAME and patch the first `function X(){return
+              # <name>()}` after it on the same line (perl -pe is per line; both pairs share
+              # one). index.pre.js also installs a global ChildProcess.spawn hook given
+              # `helper:Ve()` that reroutes Mach-O/shebang spawns through the helper; it only
+              # fires when the helper is an executable file, never true on Linux, so it needs
+              # no patch.
               echo "[patch:20] Patching macOS disclaimer helper resolver..."
               patch_js 20 \
-                's{(["\x60]disclaimer["\x60]\)\}\})function ([\w\$]+)\(\)\{return ([\w\$]+)\(\)\}}{$1function $2(){return process.platform==="linux"?null:$3()}}g' \
+                's{(function ([\w\$]+)\(\)\{\{[^{}]*["\x60]Helpers["\x60],["\x60]disclaimer["\x60]\)\}\}.*?)function ([\w\$]+)\(\)\{return \2\(\)\}}{$1function $3(){return process.platform==="linux"?null:$2()}}g' \
                 'function [\w$]+\(\)\{return process\.platform==="linux"\?null:[\w$]+\(\)\}'
               echo "[patch:20] Done"
 
@@ -442,10 +459,20 @@
               # build constant, not a runtime platform check. So the patch stays, and now returns
               # upstream's own Linux icons rather than the mac template pair.
               # The ico-case prefix is matched loosely ([^;]*?) because it grew a `!e&&` guard.
+              # 6.28899.6: the switch moved into a selector that takes the theme as a param,
+              #   function enc({flavor:e,safeIcon:t,theme:n,taskbarIsDark:r,linuxFlavor:i}){switch(e){
+              #     case"ico":return!t&&(r()??n.shouldUseDarkColorsForSystemIntegratedUI)?...;
+              #     case"template-image":return"TrayIconTemplate.png";
+              #     case"png":return t||i()==="gnome"||n.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"}}
+              # called as enc({flavor:PIe,theme:u.nativeTheme,linuxFlavor:M8n,...}) with
+              # PIe="template-image" (the mac build constant). The `X.nativeTheme` capture is
+              # gone, so instead of rewriting the template-image return, rewrite the switch
+              # discriminant: on Linux a template-image flavor is treated as `png`, reaching
+              # upstream's own Linux case (safe-icon / GNOME / dark-theme aware) unchanged.
               echo "[patch:08b] Patching tray icon filename selection..."
               patch_js 08b \
-                's{(switch\([\w\$.]+\)\{case["\x60]ico["\x60]:return[^;]*?([\w\$]+)\.nativeTheme\.shouldUseDarkColors\?["\x60]Tray-Win32-Dark\.ico["\x60]:["\x60]Tray-Win32\.ico["\x60];case["\x60]template-image["\x60]:return)["\x60]TrayIconTemplate\.png["\x60]}{$1 process.platform==="linux"?($2.nativeTheme.shouldUseDarkColors?"TrayIconLinux-Dark.png":"TrayIconLinux.png"):"TrayIconTemplate.png"}g' \
-                'template-image["\x60]:return process\.platform==="linux"\?\([\w$]+\.nativeTheme\.shouldUseDarkColors\?"TrayIconLinux-Dark\.png"'
+                's{switch\(([\w\$.]+)\)(\{case["\x60]ico["\x60]:return[^;]*?["\x60]Tray-Win32-Dark\.ico["\x60]:["\x60]Tray-Win32\.ico["\x60];case["\x60]template-image["\x60]:return["\x60]TrayIconTemplate\.png["\x60];case["\x60]png["\x60]:)}{switch(process.platform==="linux"&&$1==="template-image"?"png":$1)$2}g' \
+                'switch\(process\.platform==="linux"&&[\w$.]+==="template-image"\?"png":[\w$.]+\)\{case["\x60]ico'
               echo "[patch:08b] Done"
 
               # --- Patch 10: Claude Code (CCD) host platform — REMOVED (upstream) ---
@@ -557,10 +584,22 @@
               # which is likewise undefined on Linux and crashed module load with
               # "registerDefaults is not a function". Guard it the same way; the method
               # alternation keeps this one patch owning the whole user-defaults family.
-              echo "[patch:13] Patching systemPreferences setUserDefault/registerDefaults guards..."
+              # 6.28899.6: more unguarded macOS-only calls, all also undefined on Linux:
+              #   - subscribeWorkspaceNotification("NSWorkspaceDidLaunchApplicationNotification",...)
+              #     at module load: fatal ("Claude Desktop failed to launch: TypeError: ...
+              #     subscribeWorkspaceNotification is not a function"); a second site in a
+              #     dialog helper pairs it with unsubscribeWorkspaceNotification(t)
+              #   - subscribeLocalNotification("NSTextInputContext...", ...) x3 (menu refresh)
+              #   - getUserDefault / removeUserDefault (updater's Squirrel contents-swap flags)
+              # Every site is at statement start or after `let t=`, `return`, `return()=>`,
+              # `,` or `&&`, so the `process.platform==="darwin"&&` prefix keeps precedence
+              # (it would not after `!`, `typeof` or `new`; recheck if one appears there).
+              # Off darwin the expressions evaluate to false, which every caller tolerates:
+              # getUserDefault(...,"boolean") falsy is upstream's own "flag unset" value.
+              echo "[patch:13] Patching systemPreferences macOS-only call guards..."
               patch_js 13 \
-                's{([\w\$]+)\.systemPreferences\.(setUserDefault|registerDefaults)\(}{process.platform==="darwin"&&$1.systemPreferences.$2(}g' \
-                'process\.platform==="darwin"&&[\w$]+\.systemPreferences\.registerDefaults\('
+                's{([\w\$]+)\.systemPreferences\.(setUserDefault|registerDefaults|getUserDefault|removeUserDefault|subscribeWorkspaceNotification|unsubscribeWorkspaceNotification|subscribeLocalNotification)\(}{process.platform==="darwin"&&$1.systemPreferences.$2(}g' \
+                'process\.platform==="darwin"&&[\w$]+\.systemPreferences\.subscribeWorkspaceNotification\('
               echo "[patch:13] Done"
 
               # --- Patch 14: macOS-only app.configureWebAuthn guard (regex) ---
