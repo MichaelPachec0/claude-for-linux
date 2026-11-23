@@ -17,10 +17,10 @@
       # native Linux app: Linux Electron, Linux @ant/claude-native binding and the
       # QEMU/KVM Cowork VM. Version + per-arch .deb hashes are bumped automatically
       # by .github/workflows/auto-update-deb.yml.
-      claudeDebVersion = "5.1231.2";
+      claudeDebVersion = "6.28899.6";
       claudeDebHashes = {
-        x86_64-linux = "sha256-600Wya/wppY2bYhyj3T6VRNr58/ePB/jWvQGK0WVW28=";
-        aarch64-linux = "sha256-16AUTmlGl15sXzOkjbCMvgi8zaBL2xnPIlSqaQvOJcE=";
+        x86_64-linux = "sha256-fjgWAdhlcBSWQ9Uum4nCZXWrEvp4iqQf/dTMpbBjjPg=";
+        aarch64-linux = "sha256-I5wg0hhFbKzGVtSDgv1ZEWMlrGeapOR2N3rxRWrIVxU=";
       };
 
       supportedSystems = [ "x86_64-linux" "aarch64-linux" ];
