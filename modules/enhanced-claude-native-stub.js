@@ -428,5 +428,13 @@ class AuthRequest {
 const instance = new ClaudeNativeLinux();
 instance.AuthRequest = AuthRequest;
 instance.getActiveWindowHandle = () => null;
+// 6.28899.6: macOS menu key-equivalent hook, called for every accelerator while the
+// app menu is (re)built. There are no Cocoa key equivalents to keep on Linux, so
+// report "not kept" (false), which is upstream's own no-op result.
+instance.keepMenuKey = () => false;
+// 6.28899.6: per-pid memory footprints for process-memory telemetry. Callers map
+// each entry with `e ? {...} : null`, so an all-null array means "unknown" and is
+// handled; without the method every snapshot logs a TypeError instead.
+instance.readProcessFootprints = (pids) => Promise.resolve(pids.map(() => null));
 Object.assign(instance, safeFs);
 module.exports = instance;
