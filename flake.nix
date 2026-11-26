@@ -9,9 +9,9 @@
   outputs = { self, nixpkgs, flake-utils }:
     let
       # Claude Desktop version and source
-      claudeVersion = "6.28899.6";
-      claudeDmgHash = "sha256-oSJtXnBypxP36rdNBtF0X8R6pX6uO6ICoQMDLRMpUw8=";
-      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-2f5fc59b2d1c672dd9dced86720c50f48cca0cf9.dmg";
+      claudeVersion = "7.37095.0";
+      claudeDmgHash = "sha256-ppNE7cAo3BzO1xvhGc2vSX7Ap4cVVw5TDRu3OxOdrVg=";
+      claudeDmgUrl = "https://downloads.claude.ai/releases/darwin/universal/${claudeVersion}/Claude-bc368c812ec26d3a5740519cc4d5cb69bbe43025.dmg";
 
       # Official Linux build (Anthropic apt repo). Unlike the DMG above this is a
       # native Linux app: Linux Electron, Linux @ant/claude-native binding and the
